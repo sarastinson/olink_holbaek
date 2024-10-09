@@ -1,0 +1,3011 @@
+---
+title: "olink_holbaek_analyses"
+author: "Sara Stinson"
+date: "2024-10-09"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source(here::here("R/package-loading.R"))
+```
+
+## Table 1
+
+```{r table-one, warning=F, echo=F, message=F}
+
+vars <- c(
+  "age",
+  "age_group",
+  "sex",
+  "z_BMI.Nysom",
+  "waist",
+  "waist_hip_ratio",
+  "dxa_fat_prc_total",
+  "mr_real_liverfat_percent",
+  "ALAT",
+  "ASAT",
+  "GGT",
+  "LDH",
+  "bilirubin",
+  "hs_CRP_SSI",
+  "leucocytes",
+  "chol_hdl",
+  "chol_ldl",
+  "chol_total",
+  "triglycerides",
+  "HOMA",
+  "insulin",
+  "cpeptid",
+  "HbA1c",
+  "glucose",
+  "glucagon",
+  "glp1",
+  "bp_sys_z",
+  "bp_dia_z",
+  "liverfat_5perc",
+  "high_ALT",
+  "insulin_resistance",
+  "hyperglycemia",
+  "dyslipidemia",
+  "hypertension"
+)
+
+table <-
+  tableone::CreateTableOne(
+    vars = vars,
+    strata = c("obesity"),
+    data = df,
+    test = T,
+    addOverall = F
+  )
+
+print(
+    table,
+    nonnormal = c(
+        "age",
+        "z_BMI.Nysom",
+        "waist",
+        "waist_hip_ratio",
+        "dxa_fat_prc_total",
+        "leptin_SSI",
+        "adiponectin_SSI",
+        "mr_real_liverfat_percent",
+        "ALAT",
+        "ASAT",
+        "GGT",
+        "LDH",
+        "bilirubin",
+        "chol_hdl",
+        "chol_ldl",
+        "chol_total",
+        "triglycerides",
+        "hs_CRP_SSI",
+        "leucocytes",
+        "HOMA",
+        "insulin",
+        "cpeptid",
+        "HbA1c",
+        "glucose",
+        "glucagon",
+        "glp1",
+        "bp_sys_z",
+        "bp_dia_z"
+    )
+)
+
+n.ob <- df %>%
+    group_by(obesity) %>%
+    select(vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)), .names = "n_{.col}")) %>%
+    pivot_longer(cols = starts_with("n_"),
+                 names_to = "vars",
+                 values_to = "n") %>%
+    ungroup() %>%
+    dplyr::filter(obesity == 1) %>%
+    mutate(trait = gsub("^n_", "", vars)) %>%
+    rename(n_obesity = n) %>%
+    select(trait, n_obesity)
+
+n.pop <- df %>%
+    group_by(obesity) %>%
+    select(vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)), .names = "n_{.col}")) %>%
+    pivot_longer(cols = starts_with("n_"),
+                 names_to = "vars",
+                 values_to = "n") %>%
+    ungroup() %>%
+    dplyr::filter(obesity == 0) %>%
+    mutate(trait = gsub("^n_", "", vars)) %>%
+    rename(n_population = n) %>%
+    select(trait, n_population)
+
+sample.size <- full_join(n.ob, n.pop, by = "trait")
+sample.size
+
+results <- lapply(vars, function(var) {
+  kruskal.test(reformulate("ob_clinic", response = var), data = df)
+})
+names(results) <- vars
+results
+
+```
+
+## Associations of overweight or obesity with protein markers
+
+```{r lm-ob, warning=FALSE, echo=FALSE}
+
+df_select <- df %>%
+    dplyr::select(
+        blood_sample_number,
+        age,
+        gender,
+        obesity,
+        IL8:HAOX1
+    )
+
+df_long <- df_select %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+int <- function(x) {
+    if (!is.numeric(x)) {
+        stop("Input must be numeric.")
+    }
+    # Applying the inverse normal transformation using qnorm
+    inv_norm_values <-
+        qnorm((rank(x, na.last = "keep") - 0.5) / length(x))
+    return(inv_norm_values)
+}
+
+lm.obesity <- df_long %>%
+    group_by(Assay) %>%
+    nest() %>%
+    mutate(lm = map(data,
+                    ~ lm(
+                        scale(int(NPX)) ~ obesity + gender + age,
+                        data = .x
+                    )),
+           tidied = map(lm, broom.mixed::tidy)) %>%
+    unnest(tidied) %>%
+    ungroup() %>%
+    select(-c(data, lm, statistic)) %>%
+    filter(str_detect(term, 'obesity')) %>%
+    group_by(term) %>%
+    mutate(fdr = p.adjust(p.value, method = 'fdr'),
+           bonferroni = p.adjust(p.value, method = 'bonferroni'),
+           exposure = "Overweight / obesity",
+           N = n.age.sex.obesity$obesity,
+           ) %>% 
+    ungroup() %>% 
+    arrange(Assay) 
+
+lm.obesity.plot <- lm.obesity %>%
+    mutate(
+        fdr_size = case_when(fdr >= 0.05 ~ FALSE,
+                             fdr < 0.05 ~ TRUE),
+        fdr_color = case_when(
+            fdr >= 0.05 ~ "NS",
+            fdr < 0.05 & estimate > 0 ~ "+",
+            fdr < 0.05 & estimate < 0 ~ "-"
+        ),
+        fdr_color = factor(fdr_color, levels = c("-", "NS", "+")),
+        fdr_label = case_when(fdr < 1.0e-25 ~ Assay, ## not have too many labels on plot
+                              fdr >= 1.0e-25 ~ NA),
+       p.value = if_else(p.value == 0.000000e+00, 1.0e-299, p.value) # Set a cap for LEP
+    )
+
+# Create volcano plot
+fig2 <- lm.obesity.plot %>%
+    ggplot(aes(
+        x = estimate,
+        y = -log10(p.value),
+        label = fdr_label
+    )) +
+    geom_point(
+        aes(fill = fdr_color),
+        size = 2,
+        pch = 21,
+        color = "white"
+    ) +
+    labs(x = "β",
+         y = "-Log10 P-value",
+         title = "Overweight / obesity associated proteins") +
+    scale_fill_manual(values = c("#0b5394", "grey", "#6aa84f")) +
+    scale_x_continuous(limits = c(-1, 1.5)) +
+    scale_y_continuous(limits = c(0, 300)) +
+    ggrepel::geom_text_repel(
+        box.padding = 0.30,
+        max.overlaps = 12,
+        color = "black"
+    ) +
+    theme_bw() +
+    theme(
+        plot.title = element_text(
+            hjust = 0.5,
+            size = 12,
+            colour = "black",
+        ),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(
+            size = 12,
+            colour = "black",
+            margin = margin(
+                t = 15,
+                r = 0,
+                b = 0,
+                l = 0
+            )
+        ),
+        axis.title.y = element_text(
+            size = 12,
+            colour = "black",
+            margin = margin(
+                t = 0,
+                r = 15,
+                b = 0,
+                l = 0
+            )
+        ),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = "right",
+        legend.title = element_blank()
+    ) 
+fig2
+
+S1 <- lm.obesity  %>%
+    rename(outcome = Assay,
+           beta = estimate,
+           se = std.error) %>%
+    dplyr::mutate(outcome = gsub("X4EBP1", "4EBP1", outcome),
+                  CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se,
+                  N = "4024") %>% 
+    dplyr::mutate_at(vars(beta, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate_at(vars(p.value, fdr), funs(sprintf("%.3G", .))) %>% 
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>% 
+    dplyr::select(exposure, outcome, N, beta, CI, p.value, fdr) %>% 
+    dplyr::arrange(exposure, outcome)
+S1
+
+```
+
+## The interaction of overweight or obesity with age related protein markers
+
+```{r lm-age-ob, warning=FALSE, echo=FALSE}
+
+## Get interaction p-value
+int <- function(x) {
+    if (!is.numeric(x)) {
+        stop("Input must be numeric.")
+    }
+    # Applying the inverse normal transformation using qnorm
+    inv_norm_values <-
+        qnorm((rank(x, na.last = "keep") - 0.5) / length(x))
+    return(inv_norm_values)
+}
+
+df_select <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    ),
+    group_OW = recode(group_NW, "0" = "1", "1" = "0")) %>%
+    dplyr::mutate(group_NW = factor(group_NW, levels = c("0", "1")),
+                  group_OW = factor(group_OW, levels = c("0", "1"))) %>% 
+    dplyr::select(
+        blood_sample_number,
+        ob_clinic,
+        group_OW,
+        group_NW,
+        age,
+        gender,
+        IL8:HAOX1
+    )
+
+df_int <- df_select %>%
+    mutate(across(
+        c(IL8:HAOX1
+        ), int))
+
+df_scale <- df_int %>%
+    mutate(across(
+        c(age, IL8:HAOX1),  # Select specific columns
+        ~ as.numeric(scale(.))  # Ensure that scaling results in a numeric vector
+    ))
+
+df_long <- df_scale %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+# Assuming 'outcome_vars' contains the names of your outcome variables
+outcome_vars <- df_select %>% 
+    dplyr::select(IL8:HAOX1) %>% 
+    colnames()
+
+int.results <- df_long %>%
+  group_by(Assay) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(NPX ~ age * group_OW + gender, data = .x)),
+    tidied = map(model, broom::tidy)
+  ) %>%
+  unnest(tidied) %>%
+    dplyr::filter(term == "age:group_OW1")  %>% 
+    dplyr::rename(outcome = Assay,
+                  p.val.int = p.value) %>% 
+    arrange(outcome) %>% 
+    dplyr::mutate(int.fdr = p.adjust(p.val.int, method = 'fdr'),
+                  exposure = "age × overweight / obesity") %>% 
+    select(exposure, outcome, p.val.int, int.fdr)
+int.results
+
+## Overweight/obesity
+obesity.age.results <- df_long %>%
+  group_by(Assay) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(NPX ~ age * group_OW + gender, data = .x)),
+    tidied = map(model, broom::tidy)
+  ) %>%
+  unnest(tidied) %>%
+    dplyr::filter(term == "age")  %>% 
+    dplyr::rename(outcome = Assay,
+                  p.val.obesity = p.value,
+                  beta.obesity = estimate,
+                  se.obesity = std.error) %>% 
+    arrange(outcome) %>% 
+    dplyr::mutate(fdr.obesity = p.adjust(p.val.obesity, method = 'fdr'),
+                  exposure = "age × overweight / obesity") %>% 
+    select(exposure, outcome, beta.obesity, se.obesity, p.val.obesity, fdr.obesity)
+obesity.age.results
+
+## Normal weight
+nw.age.results <- df_long %>%
+  group_by(Assay) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(NPX ~ age * group_NW + gender, data = .x)),
+    tidied = map(model, broom::tidy)
+  ) %>%
+  unnest(tidied) %>%
+    dplyr::filter(term == "age")  %>% 
+    dplyr::rename(outcome = Assay,
+                  p.val.nw = p.value,
+                  beta.nw = estimate,
+                  se.nw = std.error) %>% 
+    arrange(outcome) %>% 
+    dplyr::mutate(fdr.nw = p.adjust(p.val.nw, method = 'fdr'),
+                  exposure = "age × overweight / obesity") %>% 
+    select(exposure, outcome, beta.nw, se.nw, p.val.nw, fdr.nw)
+nw.age.results
+
+# Merge results
+age.ob.int.results <- obesity.age.results %>% 
+    dplyr::full_join(nw.age.results, by = join_by(exposure, outcome)) %>% 
+    dplyr::full_join(int.results, by = join_by(exposure, outcome)) 
+
+## Get sample sizes
+n.ob <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    )) %>% 
+    dplyr::filter(group_NW == 1 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N_obesity"
+  ) %>% 
+    dplyr::select(outcome, N_obesity)
+
+n.nw <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    )) %>% 
+    dplyr::filter(group_NW == 0 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N_nw"
+  ) %>% 
+    dplyr::select(outcome, N_nw)
+
+S2 <- age.ob.int.results  %>% 
+    full_join(n.ob) %>% 
+    full_join(n.nw) %>% 
+    dplyr::mutate(outcome = gsub("X4EBP1", "4EBP1", outcome),
+                  ci.lower.obesity = exp(beta.obesity - 1.96 * se.obesity),  # Lower bound of 95% CI
+                  ci.upper.obesity = exp(beta.obesity + 1.96 * se.obesity),
+                  ci.lower.nw = exp(beta.nw - 1.96 * se.nw),  # Lower bound of 95% CI
+                  ci.upper.nw = exp(beta.nw + 1.96 * se.nw)) %>% 
+    dplyr::mutate_at(vars(beta.obesity, ci.lower.obesity, ci.upper.obesity, beta.nw, ci.lower.nw, ci.upper.nw), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate_at(vars(p.val.obesity, p.val.nw, fdr.obesity, fdr.nw, p.val.int, int.fdr), funs(sprintf("%.3G", .))) %>% 
+    dplyr::mutate(ci.obesity = paste0("(", ci.lower.obesity, " , ", ci.upper.obesity, ")"),
+                  ci.nw = paste0("(", ci.lower.nw, " , ", ci.upper.nw, ")")) %>% 
+    select(exposure, outcome, N_obesity, beta.obesity, ci.obesity, p.val.obesity, fdr.obesity,
+           N_nw, beta.nw, ci.nw, p.val.nw, fdr.nw, p.val.int, int.fdr) %>% 
+    dplyr::arrange(exposure, outcome)
+S2
+
+## Forest plot for obesity x age (fig3c)
+obesity.age.df <- df_long %>%
+  group_by(Assay) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(NPX ~ age * group_OW + gender, data = .x)),
+    tidied = map(model, broom::tidy)
+  ) %>%
+  unnest(tidied) %>%
+    dplyr::filter(term == "age")  %>% 
+    dplyr::rename(outcome = Assay,
+                  p.val = p.value,
+                  beta = estimate,
+                  se = std.error) %>% 
+    arrange(outcome) %>% 
+    dplyr::mutate(fdr = p.adjust(p.val, method = 'fdr'),
+                  exposure = "age × overweight / obesity",
+                  group = "Overweight/Obesity") %>% 
+    select(exposure, outcome, group, beta, se, p.val, fdr)
+obesity.age.df
+
+## Normal weight
+nw.age.df <- df_long %>%
+  group_by(Assay) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(NPX ~ age * group_NW + gender, data = .x)),
+    tidied = map(model, broom::tidy)
+  ) %>%
+  unnest(tidied) %>%
+    dplyr::filter(term == "age")  %>% 
+    dplyr::rename(outcome = Assay,
+                  p.val = p.value,
+                  beta = estimate,
+                  se = std.error) %>% 
+    arrange(outcome) %>% 
+    dplyr::mutate(fdr = p.adjust(p.val, method = 'fdr'),
+                  exposure = "age × overweight / obesity",
+                  group = "Normal weight") %>% 
+    select(exposure, outcome, group, beta, se, p.val, fdr)
+nw.age.df
+
+age.obesity.int <- obesity.age.df  %>% 
+    full_join(nw.age.df) %>% 
+    dplyr::full_join(int.results, by = join_by(exposure, outcome)) %>% 
+    dplyr::filter(int.fdr < 0.0001) %>% 
+    dplyr::mutate(outcome = gsub("X4EBP1", "4EBP1", outcome),
+                  ci.lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  ci.upper = beta + 1.96 * se)
+    
+age.obesity.int 
+
+##
+age.obesity.int <- age.obesity.int %>%
+    dplyr::mutate(outcome = gsub("PDGF_subunit_B", "PDGF subunit B", outcome)) %>% 
+    mutate(
+    significance = factor(case_when(
+      p.val < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    ), levels = c("P < 5% FDR", "P < 0.05", "Not Significant"))
+  ) %>% 
+  arrange(int.fdr) 
+
+out_sig <- age.obesity.int %>% 
+    distinct(outcome)  %>%
+  pull(outcome) %>%
+  rev()
+
+age.obesity.int$outcome <- factor(
+    age.obesity.int$outcome,
+    levels = c(
+        "PDGF subunit B",
+        "VSIG2",
+        "CXCL10",
+        "CD84",
+        "Dkk1",
+        "IL18R1" ,
+        "SPON2" ,
+        "STAMBP",
+        "DECR1",
+        "ANGPT1",
+        "Gal9",
+        "AXIN1",
+        "SIRT2",
+        "MCP1",
+        "HAOX1",
+        "CD40L"  ,
+        "ITGB1BP2" ,
+        "ADM",
+        "CSF1",
+        "CCL19" ,
+        "LOX1" ,
+        "HGF" ,
+        "IL1ra"  ,
+        "STK4"  ,
+        "LEP" ,
+        "OSM"
+    )
+)
+
+# Create a basic forest plot using ggplot2
+fig3c <- age.obesity.int  %>% 
+    ggplot(aes(x = beta, y = outcome, color = group)) +
+  geom_vline(xintercept = 0, linetype = 1, color = "gray40") +  # Reference line at 1 (e.g., for odds ratios)
+    geom_point(aes(size = significance)) +  # Points for the estimates
+  geom_errorbarh(aes(xmin = ci.lower, xmax = ci.upper), height = 0.2) +  # Horizontal error bars for 95% CI
+  labs(
+    x = "β (95% CI) per s.d. unit age",
+    y = " ",
+    color = " ", 
+    size = "P-value" 
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12, colour = "black"),
+        axis.title = element_text(size = 12, colour = "black"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+    legend.position = "right",    
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y= element_blank(),
+    panel.grid.major.y= element_blank()
+  ) +
+  scale_color_manual(values = c("#543005", "#9ec2e4"))  + #
+  scale_size_manual(values = c("P < 5% FDR" = 4, "P < 0.05" = 3, "Not Significant" = 2), drop = T) +  
+  scale_shape_manual(values = c("P < 5% FDR" = 16, "P < 0.05" = 16, "Not Significant" = 16), drop = T) 
+print(fig3c)
+
+```
+## PLS-DA
+
+```{r pls-da, echo=FALSE, warning=FALSE}
+
+library(ropls)         # For performing PLS-DA
+
+df2 <- df %>% dplyr::mutate(obesity_group = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)),
+    obesity_group = factor(obesity_group, levels = c("0", "1"))) %>% 
+    dplyr::filter(!is.na(obesity_group)) %>% 
+     mutate(
+    age_group = case_when(
+      sex == "Girls" & age < 9 ~ "1",
+      sex == "Boys" & age < 10 ~ "1",
+      sex == "Girls" & age >= 9 & age <= 15 ~ "2",
+      sex == "Boys" & age >= 10 & age <= 16 ~ "2",
+      sex == "Girls" & age > 15 ~ "3",
+      sex == "Boys" & age > 16 ~ "3",
+      TRUE ~ "Unknown"
+    )
+  )
+
+df_ob <- df2 %>% 
+    dplyr::filter(obesity_group == "1") %>% 
+    dplyr::mutate(age_group = as.factor(age_group)) %>% 
+    dplyr::select(blood_sample_number, age_group, IL8:HAOX1) %>%
+    na.omit()  # Remove any rows with missing values
+
+# Prepare the predictor (X) and response (Y) matrices
+X <- as.matrix(df_ob %>% select(-age_group, -blood_sample_number))  # Protein levels (predictors)
+Y <- df_ob$age_group                          # Age group numeric variable (response)
+
+rownames(X) <- df_ob$blood_sample_number
+
+plsModel_ob <-
+    ropls::opls(
+        X,
+        df_ob$age_group,
+        permI = 300,
+        predI = 2,
+        crossvalI = 10
+    ) 
+
+data <- as.data.frame(plsModel_ob@scoreMN)
+data$group <- df_ob$age_group  # Add group information
+data$samples <- rownames(data)
+data <- data %>% dplyr::mutate(group = case_when(group == 1 ~ "Age group 1",
+                                         group == 2 ~ "Age group 2",
+                                         group == 3 ~ "Age group 3"))
+colnames(data)[3] <- "Overweight/Obesity"
+
+x_lab <- plsModel_ob@modelDF[1, "R2X"] * 100
+y_lab <- plsModel_ob@modelDF[2, "R2X"] * 100
+
+col = c("#2171B5", "#FDCC3F", "#006837")
+
+# Create PLS-DA plot
+plsda_ob <- ggplot(data,
+                       aes(
+                           x = p1,
+                           y = p2,
+                           color = `Overweight/Obesity`,
+                           shape = `Overweight/Obesity`
+                       )) +
+    theme_bw() +
+    geom_vline(xintercept = 0,
+               lty = 1,
+               size = 0.4,
+               color = "grey40") +
+    geom_hline(yintercept = 0,
+               lty = 1,
+               size = 0.4,
+               color = "grey40") +
+    geom_point(size = 1.0) +
+    theme(panel.grid = element_blank()) +
+    labs(x = paste0("P1 (", x_lab, "%)"),
+         y = paste0("P2 (", y_lab, "%)")) +
+    stat_ellipse(
+        data = data,
+        geom = "polygon",
+        level = 0.95,
+        linetype = 0,
+        size = 0.5,
+        aes(fill = `Overweight/Obesity`),
+        alpha = 0.2,
+        show.legend = T
+    ) +
+    scale_color_manual(values = col) +
+    scale_fill_manual(values = col) +
+    scale_y_continuous(limits = c(-10, 10), breaks = c(-10,-5, 0, 5, 10)) +
+    scale_x_continuous(limits = c(-10, 10), breaks = c(-10,-5, 0, 5, 10)) +
+    theme(
+        text = element_text(family = "sans", size = 12),
+        legend.text = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black"),
+        axis.title.y = element_text(size = 12, angle = 90, colour = "black"),
+        axis.text.y = element_text(size = 12,  colour = "black"),
+        axis.text.x = element_text(size = 12, colour = "black"),
+        panel.grid = element_blank()
+    )
+plsda_ob
+
+df_nw <- df2 %>% 
+    dplyr::filter(obesity_group == "0") %>% 
+    dplyr::mutate(age_group = as.factor(age_group)) %>% 
+    dplyr::select(blood_sample_number, age_group, IL8:HAOX1) %>%
+    na.omit()  # Remove any rows with missing values
+
+# Prepare the predictor (X) and response (Y) matrices
+X <- as.matrix(df_nw %>% select(-age_group, -blood_sample_number))  # Protein levels (predictors)
+Y <- df_nw$age_group                          # Age group numeric variable (response)
+
+rownames(X) <- df_nw$blood_sample_number
+
+plsModel_nw <-
+    ropls::opls(
+        X,
+        df_nw$age_group,
+        permI = 300,
+        predI = 2,
+        crossvalI = 10
+    ) 
+
+data <- as.data.frame(plsModel_nw@scoreMN)
+data$group <- df_nw$age_group  # Add group information
+data$samples <- rownames(data)
+data <- data %>% dplyr::mutate(group = case_when(group == 1 ~ "Age group 1",
+                                         group == 2 ~ "Age group 2",
+                                         group == 3 ~ "Age group 3"))
+
+colnames(data)[3] <- "Normal weight"
+
+x_lab <- plsModel_nw@modelDF[1, "R2X"] * 100
+y_lab <- plsModel_nw@modelDF[2, "R2X"] * 100
+
+col = c("#2171B5", "#FDCC3F", "#006837")
+
+# Create PLS-DA plot
+plsda_nw <- ggplot(data,
+                       aes(
+                           x = p1,
+                           y = p2,
+                           color = `Normal weight`,
+                           shape = `Normal weight`
+                       )) +
+    theme_bw() +
+    geom_vline(xintercept = 0,
+               lty = 1,
+               size = 0.4,
+               color = "grey40") +
+    geom_hline(yintercept = 0,
+               lty = 1,
+               size = 0.4,
+               color = "grey40") +
+    geom_point(size = 1.0) +
+    theme(panel.grid = element_blank()) +
+    labs(x = paste0("P1 (", x_lab, "%)"),
+         y = paste0("P2 (", y_lab, "%)")) +
+    stat_ellipse(
+        data = data,
+        geom = "polygon",
+        level = 0.95,
+        linetype = 0,
+        size = 0.5,
+        aes(fill = `Normal weight`),
+        alpha = 0.2,
+        show.legend = T
+    ) +
+    scale_color_manual(values = col) +
+    scale_fill_manual(values = col) +
+    scale_y_continuous(limits = c(-10, 10), breaks = c(-10,-5, 0, 5, 10)) +
+    scale_x_continuous(limits = c(-10, 10), breaks = c(-10,-5, 0, 5, 10)) +
+    theme(
+        text = element_text(family = "sans", size = 12),
+        legend.text = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black"),
+        axis.title.y = element_text(size = 12, angle = 90, colour = "black"),
+        axis.text.y = element_text(size = 12,  colour = "black"),
+        axis.text.x = element_text(size = 12, colour = "black"),
+        panel.grid = element_blank()
+    )
+plsda_nw
+
+boxplot_df <- df2 %>% 
+  dplyr::select(blood_sample_number, obesity_group, age_group, OSM, LEP, IL1ra, HGF) %>% 
+  pivot_longer(cols = c(OSM, LEP, IL1ra, HGF), 
+               names_to = "Assay",  
+               values_to = "NPX") 
+
+fig3d <- boxplot_df %>%
+  mutate(Assay = factor(Assay, levels = c("OSM", "LEP", "IL1ra", "HGF")),
+         obesity_group = as.factor(case_when(obesity_group == 1 ~ "Overweight/Obesity",
+                                         obesity_group == 0 ~ "Normal weight"))) %>% 
+    dplyr::filter(!is.na(obesity_group), !is.na(age_group), !is.na(NPX)) %>% 
+  ggplot(aes(x = age_group, y = NPX, color = obesity_group)) +  # Color by group
+  geom_boxplot(outliers = T) +  # Create box plot
+  facet_wrap(~ Assay, nrow = 1) +  # Facet by Assay
+  labs(
+    x = "Age group",  # Label for x-axis
+    y = "NPX",    # Label for y-axis
+    color = " "
+  ) +
+  theme_bw() +
+  scale_color_manual(values = c("#543005", "#9ec2e4"))  +
+  theme(axis.text = element_text(size = 12, colour = "black"),
+        axis.title = element_text(size = 12, colour = "black"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+    strip.background = element_rect(fill = "white", color = "black"), 
+    legend.position = "right",  # Position of the legend
+    panel.grid = element_blank()) +
+  stat_compare_means(method = "t.test", label = "p.signif", show.legend = F)
+fig3d
+
+fig3 <-
+    ggpubr::ggarrange(
+       plsda_ob,
+       fig3c,
+       plsda_nw,
+       fig3d,
+        nrow = 2,
+        ncol = 2,
+        labels = c("a", "c", "b", "d"),
+        font.label = list(color = "black", size = 12)
+    )
+fig3
+
+```
+
+## Associations of protein markers with cardiometabolic risk 
+
+```{r cmr-features-pooled, warning=FALSE, echo=FALSE}
+
+df_select <- df %>%
+    dplyr::select(
+        blood_sample_number,
+        age,
+        gender,
+        z_BMI.Nysom,
+        liverfat_5perc, high_ALT, insulin_resistance, hyperglycemia, dyslipidemia, hypertension,
+        IL8:HAOX1
+    )
+
+df_long <- df_select %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+outcome_vars <- c("liverfat_5perc", "high_ALT", "insulin_resistance", "hyperglycemia", "dyslipidemia", "hypertension")
+
+cmr.features.results <- lapply(outcome_vars, function(var) {
+    df_long %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(glm = map(
+            data,
+            ~ glm(reformulate(c("scale(NPX)", "age", "gender", "z_BMI.Nysom"), response = var), data = .x, family = binomial)
+        ),
+        tidied = map(glm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, glm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(outcome = var) %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>% 
+        dplyr::rename(exposure = Assay,
+                      beta = estimate, 
+                      se = std.error) %>%
+        dplyr::select(exposure, outcome, beta, se, p.value)
+})
+
+# Combine the results for all outcome variables
+cmrfeatures_results <- bind_rows(cmr.features.results)
+
+glm.cmr.feature <- cmrfeatures_results %>% 
+    dplyr::mutate(
+        OR = exp(beta), # Convert beta to odds ratio
+        lower_ci = exp(beta - 1.96 * se), # Lower bound of the 95% CI
+        upper_ci = exp(beta + 1.96 * se),  # Upper bound of the 95% CI,
+        fdr = p.adjust(p.value, method = 'fdr'),
+        bonferroni = p.adjust(p.value, method = 'bonferroni'),
+        outcome = case_when(
+            outcome == "liverfat_5perc" ~ "Hepatic steatosis (liver fat ≥ 5.0 %)",
+            outcome == "high_ALT" ~ "High ALT",
+            outcome == "insulin_resistance" ~ "Insulin resistance",
+            outcome == "hyperglycemia" ~ "Hyperglycemia",
+            outcome == "dyslipidemia" ~ "Dyslipidemia",
+            outcome == "hypertension" ~ "Hypertension"
+        ),
+        outcome_class = "Risk Features"
+    ) %>% 
+    dplyr::mutate(exposure = gsub("X4EBP1", "4EBP1", exposure)) %>% 
+    dplyr::select(outcome_class, outcome, exposure, OR, beta, se, p.value, fdr, bonferroni) 
+
+cmr.n <- df %>%
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+    pivot_longer(
+        cols = everything(),
+        names_to = "outcome",
+        values_to = "N"
+    ) %>% 
+    mutate(
+        outcome = case_when(
+            outcome == "liverfat_5perc" ~ "Hepatic steatosis (liver fat ≥ 5.0 %)",
+            outcome == "high_ALT" ~ "High ALT",
+            outcome == "insulin_resistance" ~ "Insulin resistance",
+            outcome == "hyperglycemia" ~ "Hyperglycemia",
+            outcome == "dyslipidemia" ~ "Dyslipidemia",
+            outcome == "hypertension" ~ "Hypertension"
+        )
+    ) %>% 
+    select(outcome, N)
+
+cmr.feature.lm.table <- full_join(glm.cmr.feature, cmr.n)
+
+cmr.feature.lm.table$outcome <- factor(
+    cmr.feature.lm.table$outcome,
+    levels = c("Hepatic steatosis (liver fat ≥ 5.0 %)", "High ALT", "Insulin resistance", "Hyperglycemia", "Dyslipidemia", "Hypertension")
+)
+
+S3 <- cmr.feature.lm.table %>% 
+    dplyr::mutate(CI_Lower = exp(beta - 1.96 * se),  # Lower bound of 95% CI
+                  CI_Upper = exp(beta + 1.96 * se)) %>% 
+    dplyr::mutate_at(vars(OR, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate_at(vars(p.value, fdr, bonferroni), funs(sprintf("%.3G", .))) %>% 
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>% 
+    dplyr::select(exposure, outcome, N, OR, CI, p.value, fdr) %>% 
+    arrange(outcome, exposure)
+S3
+```
+
+```{r cmr-traits-pool, warning=FALSE, echo=FALSE}
+df_select <- df %>%
+    dplyr::select(
+        blood_sample_number,
+        age,
+        gender,
+        z_BMI.Nysom,
+        mr_real_liverfat_percent,
+        ALAT,
+        ASAT,
+        GGT,
+        LDH,
+        bilirubin,
+        HOMA,
+        insulin,
+        cpeptid,
+        HbA1c,
+        glucose,
+        chol_hdl,
+        chol_ldl,
+        chol_total,
+        triglycerides,
+        hs_CRP_SSI,
+        leucocytes,
+        glucagon,
+        glp1,
+        bp_sys_z,
+        bp_dia_z,
+        IL8:HAOX1
+    )
+
+df_long <- df_select %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+df_log <- df_long %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+        ),
+        log
+    ))
+
+df_scale <- df_log %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+          bp_sys_z,
+          bp_dia_z,
+        ),
+        scale
+    ))
+
+# Assuming 'outcome_vars' contains the names of your outcome variables
+outcome_vars <- c("mr_real_liverfat_percent",
+                  "ALAT",
+                  "ASAT",
+                  "GGT",
+                  "LDH",
+                  "bilirubin",
+                  "HOMA",
+                  "insulin",
+                  "cpeptid",
+                  "HbA1c",
+                  "glucose",
+                  "chol_hdl",
+                  "chol_ldl",
+                  "chol_total",
+                  "triglycerides",
+                  "hs_CRP_SSI",
+                  "leucocytes",
+                  "glucagon",
+                  "glp1",
+                  "bp_sys_z",
+                  "bp_dia_z"
+                  ) 
+
+cmr.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX)", "age", "gender", "z_BMI.Nysom"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(outcome = var) %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>% 
+        dplyr::rename(exposure = Assay,
+                      beta = estimate, 
+                      se = std.error) %>%
+        dplyr::select(exposure, outcome, beta, se, p.value)
+})
+
+# Combine the results for all outcome variables
+cmr_result <- bind_rows(cmr.results)
+
+lm.cmr <- cmr_result %>% 
+    dplyr::mutate(
+        fdr = p.adjust(p.value, method = 'fdr'),
+        bonferroni = p.adjust(p.value, method = 'bonferroni'),
+        outcome = case_when(
+        grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS"
+    ),
+        outcome_class = case_when(
+            outcome %in% c("Liver fat %", "ALT", "AST", "GGT", "LDH", "Bilirubin") ~ "Liver",
+            outcome %in% c("HDL-C", "LDL-C", "TC", "TG") ~ "Lipid",
+            outcome %in% c("HOMA-IR", "Insulin", "C-peptide", "Glucose", "HbA1c") ~ "Glycemic",
+            outcome %in% c("hs-CRP", "WBC") ~ "Inflammatory",
+            outcome %in% c("DBP SDS", "SBP SDS") ~ "Blood pressure",
+            outcome %in% c("Glucagon", "Total GLP-1") ~ "Proglucagon"
+        )
+    ) %>% 
+    dplyr::mutate(exposure = gsub("X4EBP1", "4EBP1", exposure),
+                  model = "Traits") %>% 
+    dplyr::select(model, outcome_class, outcome, exposure, beta, se, p.value, fdr, bonferroni)
+
+cmr.lm.sig <- lm.cmr %>% 
+    dplyr::filter(fdr < 0.05) %>% 
+    dplyr::filter(beta < 0) %>% 
+    distinct(exposure)
+
+cmr.n <- df %>%
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N"
+  ) %>% 
+    mutate(
+        outcome = case_when(
+            grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS"
+        )
+    ) %>% 
+    select(outcome, N)
+
+cmr.lm.table <- full_join(lm.cmr, cmr.n) 
+
+cmr.lm.table$outcome <-
+    factor(
+        cmr.lm.table$outcome,
+        levels = c(
+            "Liver fat %",
+            "ALT",
+            "AST",
+            "GGT",
+            "LDH",
+            "Bilirubin",
+            "hs-CRP",
+            "WBC",
+            "HOMA-IR",
+            "Insulin",
+            "C-peptide",
+            "Glucose",
+            "HbA1c",
+            "Glucagon",
+            "Total GLP-1",
+            "HDL-C",
+            "LDL-C",
+            "TC",
+            "TG",
+            "SBP SDS",
+            "DBP SDS"
+        )
+    )
+
+S4 <- cmr.lm.table %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,
+               CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::mutate_at(vars(beta, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate_at(vars(p.value, fdr, bonferroni), funs(sprintf("%.3G", .))) %>% 
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>% 
+    dplyr::select(exposure, outcome, N, beta, CI, p.value, fdr) %>% 
+    arrange(outcome, exposure)
+S4
+```
+
+```{r fig4b, warning=FALSE, echo=FALSE}
+
+panel <- panel_df %>% 
+    rename(exposure = Assay)
+
+lm.cmr2 <- lm.cmr %>% mutate(
+    significance = case_when(
+      p.value < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    )
+  ) %>% 
+    dplyr::left_join(panel)
+
+top_pro <- lm.cmr %>%
+    dplyr::group_by(outcome) %>%
+    arrange(p.value) %>%
+    do(head(.,3)) #select top 3 proteins for each cardiometabolic trait to reduce heatmap
+
+lm.cmr.df <- lm.cmr2[lm.cmr2$exposure %in% top_pro$exposure, ]
+
+lm.cmr.df$outcome <-
+    factor(
+        lm.cmr.df$outcome,
+        levels = c(
+            "Liver fat %",
+            "ALT",
+            "AST",
+            "GGT",
+            "LDH",
+            "Bilirubin",
+            "hs-CRP",
+            "WBC",
+            "HOMA-IR",
+            "Insulin",
+            "C-peptide",
+            "Glucose",
+            "HbA1c",
+            "Glucagon",
+            "Total GLP-1",
+             "HDL-C",
+             "LDL-C",
+            "TC",
+            "TG",
+            "SBP SDS",
+             "DBP SDS"
+        ))
+
+lm.cmr.df$outcome_class <-
+    factor(
+        lm.cmr.df$outcome_class,
+        levels = c(
+            "Liver",
+            "Lipid",
+            "Inflammatory",
+            "Glycemic",
+            "Proglucagon",
+            "Blood pressure"
+        ))
+
+exposure_dist <- dist(lm.cmr.df %>% 
+                        select(exposure, outcome, beta) %>%
+                        spread(outcome, beta) %>%
+                        column_to_rownames("exposure") %>% 
+                        as.matrix(), 
+                      method = "euclidean")  # You can change to "manhattan" or other methods
+
+# Perform hierarchical clustering on the 'exposure' distance matrix
+exposure_hclust <- hclust(exposure_dist, method = "complete")  # You can change the method to "ward.D", "single", etc.
+
+# Reorder the exposures based on clustering
+lm.cmr.df$exposure <- factor(lm.cmr.df$exposure, levels = exposure_hclust$labels[exposure_hclust$order])
+
+fig4b <- lm.cmr.df %>%
+  ggplot(aes(x = outcome, y = exposure, fill = beta)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", high = "orange", mid = "white", midpoint = 0, 
+                       #limits = c(-0.35, 0.6),
+    breaks = c(-0.2, 0, 0.2, 0.4), 
+    labels = c("-0.2", "0", "0.2", "0.4"), 
+                       name = "Beta") +  # Color gradient based on beta values
+  theme_bw() +  # Clean theme
+  labs(x = " ", y = " ") +
+    geom_point(data = lm.cmr.df %>% filter(significance == "P < 5% FDR"),
+             aes(x = outcome, y = exposure, shape = "P < 5% FDR", color = "P < 5% FDR"),  # Map shape and color to legend
+              fill = "black", size = 1, stroke = 0.4) +
+
+  # Circle with border for p < 0.05 but not P < 5% FDR
+  geom_point(data = lm.cmr.df %>% filter(significance == "P < 0.05" & fdr >= 0.05),
+             aes(x = outcome, y = exposure, shape = "P < 0.05", color = "P < 0.05"),  # Map shape and color to legend
+            fill = "transparent", size = 1, stroke = 0.4) + 
+
+
+  # Add shape legend
+  scale_shape_manual(values = c("P < 5% FDR" = 21, "P < 0.05" = 21), name = "P-value") +
+
+  # Use color to differentiate the circles
+  scale_color_manual(values = c("P < 5% FDR" = "black", "P < 0.05" = "grey20"),
+                     name = "P-value") +
+  theme(axis.text.y = element_blank(),  # Remove y-axis text
+        axis.ticks.y = element_blank(),  # Remove y-axis ticks (optional)
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12, colour = "black"),  # Rotate x-axis text
+        axis.title = element_text(size = 12),
+        panel.grid = element_blank(),  # Remove grid lines
+        legend.text = element_text(size = 11, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        legend.position = "bottom",
+        strip.text.x = element_blank(),
+        strip.background.y = element_rect(fill = "white", color = "white"),  # Set strip background to white with a black border
+    strip.text = element_text(color = "black", size = 12)
+  ) +
+    guides(
+    shape = guide_legend(override.aes = list(size = 2)),  # Increase point size in legend
+    color = guide_legend(override.aes = list(size = 2))   # Increase color point size in legend
+  ) +
+  facet_grid( ~ outcome_class, scales = "free_x", space = "free_x")  # Ensure consistent tile size across facets
+fig4b
+
+```
+
+## The interaction of overweight or obesity with sex related protein markers
+
+```{r lm-ob-sex, warning=FALSE, echo=FALSE}
+
+df_select <- df %>%
+    dplyr::mutate(group_boys = as.factor(
+        case_when(gender == 1 ~ 0,
+                  gender == 2 ~ 1)
+    ),
+    group_girls = recode(group_boys, "0" = "1", "1" = "0")) %>%
+    dplyr::mutate(group_boys = factor(group_boys, levels = c("0", "1")),
+                  group_girls = factor(group_girls, levels = c("0", "1"))) %>% 
+    dplyr::select(
+        blood_sample_number,
+        group_girls,
+        group_boys,
+        age,
+        gender,
+        z_BMI.Nysom,
+        mr_real_liverfat_percent,
+        ALAT,
+        ASAT,
+        GGT,
+        LDH,
+        bilirubin,
+        HOMA,
+        insulin,
+        cpeptid,
+        HbA1c,
+        glucose,
+        chol_hdl,
+        chol_ldl,
+        chol_total,
+        triglycerides,
+        hs_CRP_SSI,
+        leucocytes,
+        glucagon,
+        glp1,
+        bp_sys_z,
+        bp_dia_z,
+        IL8:HAOX1
+    )
+
+df_long <- df_select %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+df_log <- df_long %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+        ),
+        log
+    ))
+
+df_scale <- df_log %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+          bp_sys_z,
+          bp_dia_z
+        ),
+        scale
+    ))
+
+# Assuming 'outcome_vars' contains the names of your outcome variables
+outcome_vars <- c("mr_real_liverfat_percent",
+                  "ALAT",
+                  "ASAT",
+                  "GGT",
+                  "LDH",
+                  "bilirubin",
+                  "HOMA",
+                  "insulin",
+                  "cpeptid",
+                  "HbA1c",
+                  "glucose",
+                  "chol_hdl",
+                  "chol_ldl",
+                  "chol_total",
+                  "triglycerides",
+                  "hs_CRP_SSI",
+                  "leucocytes",
+                  "glucagon",
+                  "glp1",
+                  "bp_sys_z",
+                  "bp_dia_z"
+                  ) 
+
+int.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_girls", "age", "z_BMI.Nysom"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX):group_girls1") %>% 
+        group_by(term) %>%
+        mutate(outcome = var) %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>% 
+        dplyr::rename(p.val.int = p.value) %>% 
+        dplyr::mutate(
+            int.fdr = p.adjust(p.val.int, method = 'fdr'),
+            int.bonferroni = p.adjust(p.val.int, method = 'bonferroni')) %>% 
+        dplyr::select(Assay, outcome, p.val.int, int.fdr, int.bonferroni)
+})
+
+# Combine the results for all outcome variables
+int_result <- bind_rows(int.results)
+
+## Overweight
+boys.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_boys", "age", "z_BMI.Nysom"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(fdr = p.adjust(p.value, method = 'fdr'),
+               bonferroni = p.adjust(p.value, method = 'bonferroni'),
+               outcome = var,
+               group = "Boys") %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>%
+        dplyr::select(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni)
+})
+
+# Combine the results for all outcome variables
+boys_result <- bind_rows(boys.results)
+
+## Normal weight
+girls.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_girls", "age", "z_BMI.Nysom"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(fdr = p.adjust(p.value, method = 'fdr'),
+               bonferroni = p.adjust(p.value, method = 'bonferroni'),
+               outcome = var,
+               group = "Girls") %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>%
+        dplyr::select(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni)
+})
+
+# Combine the results for all outcome variables
+girls_result <- bind_rows(girls.results)
+
+merge1 <- full_join(girls_result, int_result)
+merge2 <- full_join(boys_result, int_result)
+merge3 <- full_join(merge1, merge2, by = join_by(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni, p.val.int, int.fdr, int.bonferroni))
+
+lm.cmr.sex.int <- merge3 %>%
+    dplyr::mutate(outcome = case_when(
+        grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        
+    ),
+        category = case_when(
+            outcome %in% c("Liver fat %", "ALT", "AST", "GGT", "LDH", "Bilirubin") ~ "Liver",
+            outcome %in% c("HDL-C", "LDL-C", "TC", "TG") ~ "Lipid",
+            outcome %in% c("HOMA-IR", "Insulin", "C-peptide", "Glucose", "HbA1c") ~ "Glycemic",
+            outcome %in% c("hs-CRP", "WBC") ~ "Inflammatory",
+            outcome %in% c("DBP SDS", "SBP SDS") ~ "Blood pressure",
+            outcome %in% c("Glucagon", "Total GLP-1") ~ "Proglucagon"
+        ), model = "Traits"
+    ) 
+
+cmr.n.girls <- df %>%
+        dplyr::mutate(group_boys = as.factor(
+        case_when(gender == 1 ~ 0,
+                  gender == 2 ~ 1)
+    ),
+    group_girls = recode(group_boys, "0" = "1", "1" = "0")) %>%
+    dplyr::mutate(group_boys = factor(group_boys, levels = c("0", "1")),
+                  group_girls = factor(group_girls, levels = c("0", "1"))) %>% 
+    dplyr::filter(group_boys == 1 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N"
+  ) %>% 
+    mutate(
+        outcome = case_when(
+            grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        )
+    ) %>% 
+    dplyr::mutate(group = "Girls") %>% 
+    select(outcome, group, N)
+
+cmr.n.boys <- df %>%
+   dplyr::mutate(group_boys = as.factor(
+        case_when(gender == 1 ~ 0,
+                  gender == 2 ~ 1)
+    ),
+    group_girls = recode(group_boys, "0" = "1", "1" = "0")) %>%
+    dplyr::mutate(group_boys = factor(group_boys, levels = c("0", "1")),
+                  group_girls = factor(group_girls, levels = c("0", "1"))) %>% 
+    dplyr::filter(group_boys == 0 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N"
+  ) %>% 
+    mutate(
+        outcome = case_when(
+            grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        )
+    ) %>% 
+    dplyr::mutate(group = "Boys") %>% 
+    select(outcome, group, N)
+
+cmr.n.groups <- full_join(cmr.n.girls, cmr.n.boys) 
+
+lm.cmr.sex.int$outcome <- factor(lm.cmr.sex.int$outcome, level=c("Liver fat %", "ALT","AST","GGT", "LDH","Bilirubin", "HDL-C", "LDL-C", "TC","TG", "C-peptide", "HOMA-IR","Insulin", "Glucose", "HbA1c", "hs-CRP", "WBC",  "Glucagon", "Total GLP-1", "SBP SDS", "DBP SDS"))
+
+lm.cmr.sex.int.n <- lm.cmr.sex.int %>% 
+    full_join(cmr.n.groups, by = join_by(outcome, group))
+
+S5 <- lm.cmr.sex.int.n %>% 
+    dplyr::filter(int.fdr < 0.05) %>% 
+    dplyr::mutate(Assay = gsub("X4EBP1", "4EBP1", Assay),
+                  covariates = "group, age, sex, storage time") %>% 
+    dplyr::rename(beta = estimate,
+                  se = std.error,
+                  exposure = Assay) %>% 
+    dplyr::select(outcome, exposure, group, N, beta, se, p.value, fdr, p.val.int, int.fdr) %>%
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::mutate_at(vars(beta, se, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>%
+    dplyr::mutate_at(vars(p.value, fdr, p.val.int, int.fdr), funs(sprintf("%.3G", .))) %>%
+    dplyr::select(-CI_Lower, -CI_Upper, -se) %>% 
+    pivot_wider(names_from = group,
+                values_from = c(N, beta, CI, p.value, fdr)) %>% 
+    dplyr::arrange(outcome, exposure) %>%
+    dplyr::select(exposure, outcome, N_Girls, beta_Girls, CI_Girls, p.value_Girls, fdr_Girls, N_Boys, beta_Boys, CI_Boys, p.value_Boys, fdr_Boys, p.val.int, int.fdr) 
+S5
+```
+
+## The interaction of overweight or obesity with protein on cardiometabolic risk
+
+```{r lm-ob-protein-cmr, warning=FALSE, echo=FALSE}
+
+df_select <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    ),
+    group_OW = recode(group_NW, "0" = "1", "1" = "0")) %>%
+    dplyr::mutate(group_NW = factor(group_NW, levels = c("0", "1")),
+                  group_OW = factor(group_OW, levels = c("0", "1"))) %>% 
+    dplyr::select(
+        blood_sample_number,
+        ob_clinic,
+        group_OW,
+        group_NW,
+        age,
+        gender,
+        z_BMI.Nysom,
+        mr_real_liverfat_percent,
+        ALAT,
+        ASAT,
+        GGT,
+        LDH,
+        bilirubin,
+        HOMA,
+        insulin,
+        cpeptid,
+        HbA1c,
+        glucose,
+        chol_hdl,
+        chol_ldl,
+        chol_total,
+        triglycerides,
+        hs_CRP_SSI,
+        leucocytes,
+        glucagon,
+        glp1,
+        bp_sys_z,
+        bp_dia_z,
+        IL8:HAOX1
+    )
+
+df_long <- df_select %>%
+    tidyr::pivot_longer(cols = c(IL8:HAOX1),
+                        names_to = "Assay",
+                        values_to = "NPX")
+
+df_log <- df_long %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+        ),
+        log
+    ))
+
+df_scale <- df_log %>%
+    mutate(across(
+        c(mr_real_liverfat_percent,
+          ALAT,
+          ASAT,
+          GGT,
+          LDH,
+          bilirubin,
+          HOMA,
+          insulin,
+          cpeptid,
+          HbA1c,
+          glucose,
+          chol_hdl,
+          chol_ldl,
+          chol_total,
+          triglycerides,
+          hs_CRP_SSI,
+          leucocytes,
+          glucagon,
+          glp1,
+          bp_sys_z,
+          bp_dia_z
+        ),
+        scale
+    ))
+
+# Assuming 'outcome_vars' contains the names of your outcome variables
+outcome_vars <- c("mr_real_liverfat_percent",
+                  "ALAT",
+                  "ASAT",
+                  "GGT",
+                  "LDH",
+                  "bilirubin",
+                  "HOMA",
+                  "insulin",
+                  "cpeptid",
+                  "HbA1c",
+                  "glucose",
+                  "chol_hdl",
+                  "chol_ldl",
+                  "chol_total",
+                  "triglycerides",
+                  "hs_CRP_SSI",
+                  "leucocytes",
+                  "glucagon",
+                  "glp1",
+                  "bp_sys_z",
+                  "bp_dia_z"
+                  ) 
+
+int.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_OW", "age", "gender"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX):group_OW1") %>% 
+        group_by(term) %>%
+        mutate(outcome = var) %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>% 
+        dplyr::rename(p.val.int = p.value) %>% 
+        dplyr::mutate(
+            int.fdr = p.adjust(p.val.int, method = 'fdr'),
+            int.bonferroni = p.adjust(p.val.int, method = 'bonferroni')) %>% 
+        dplyr::select(Assay, outcome, p.val.int, int.fdr, int.bonferroni)
+})
+
+# Combine the results for all outcome variables
+int_result <- bind_rows(int.results)
+
+## Overweight
+ow.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_OW", "age", "gender"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(fdr = p.adjust(p.value, method = 'fdr'),
+               bonferroni = p.adjust(p.value, method = 'bonferroni'),
+               outcome = var,
+               group = "obesity") %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>%
+        dplyr::select(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni)
+})
+
+# Combine the results for all outcome variables
+ow_result <- bind_rows(ow.results)
+
+## Normal weight
+nw.results <- lapply(outcome_vars, function(var) {
+    df_scale %>%
+        group_by(Assay) %>%
+        nest() %>%
+        mutate(lm = map(
+            data,
+            ~ lm(reformulate(c("scale(NPX) * group_NW", "age", "gender"), response = var), data = .x)
+        ),
+        tidied = map(lm, broom.mixed::tidy)) %>%
+        unnest(tidied) %>%
+        ungroup() %>%
+        select(-c(data, lm, statistic)) %>%
+        dplyr::filter(term == "scale(NPX)") %>% 
+        group_by(term) %>%
+        mutate(fdr = p.adjust(p.value, method = 'fdr'),
+               bonferroni = p.adjust(p.value, method = 'bonferroni'),
+               outcome = var,
+               group = "normal_weight") %>% 
+        ungroup() %>% 
+        arrange(Assay)  %>%
+        dplyr::select(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni)
+})
+
+# Combine the results for all outcome variables
+nw_result <- bind_rows(nw.results)
+
+merge1 <- full_join(ow_result, int_result)
+merge2 <- full_join(nw_result, int_result)
+merge3 <- full_join(merge1, merge2, by = join_by(Assay, outcome, group, estimate, std.error, p.value, fdr, bonferroni, p.val.int, int.fdr, int.bonferroni))
+
+lm.cmr.factor.int <- merge3 %>%
+    dplyr::mutate(outcome = case_when(
+        grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        
+    ),
+        category = case_when(
+            outcome %in% c("Liver fat %", "ALT", "AST", "GGT", "LDH", "Bilirubin") ~ "Liver",
+            outcome %in% c("HDL-C", "LDL-C", "TC", "TG") ~ "Lipid",
+            outcome %in% c("HOMA-IR", "Insulin", "C-peptide", "Glucose", "HbA1c") ~ "Glycemic",
+            outcome %in% c("hs-CRP", "WBC") ~ "Inflammatory",
+            outcome %in% c("DBP SDS", "SBP SDS") ~ "Blood pressure",
+            outcome %in% c("Glucagon", "Total GLP-1") ~ "Proglucagon"
+        ), model = "Traits"
+    ) 
+
+cmr.n.ob <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    )) %>% 
+    dplyr::filter(group_NW == 1 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N"
+  ) %>% 
+    mutate(
+        outcome = case_when(
+            grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        )
+    ) %>% 
+    dplyr::mutate(group = "obesity") %>% 
+    select(outcome, group, N)
+
+cmr.n.nw <- df %>%
+    dplyr::mutate(group_NW = as.factor(
+        case_when(z_BMI.Nysom >= -1.28 & z_BMI.Nysom < 1.28 ~ 0,
+                  z_BMI.Nysom >= 1.28 ~ 1)
+    )) %>% 
+    dplyr::filter(group_NW == 0 & !is.na(IL8)) %>% 
+    dplyr::select(outcome_vars) %>%
+    summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "outcome",
+    values_to = "N"
+  ) %>% 
+    mutate(
+        outcome = case_when(
+            grepl("mr_real_liverfat_percent", outcome) ~ "Liver fat %",
+        grepl("ALAT", outcome) ~ "ALT",
+        grepl("ASAT", outcome) ~ "AST",
+        grepl("GGT", outcome) ~ "GGT",
+        grepl("LDH", outcome) ~ "LDH",
+        grepl("bilirubin", outcome) ~ "Bilirubin",
+        grepl("HOMA", outcome) ~ "HOMA-IR",
+        grepl("insulin", outcome) ~ "Insulin",
+        grepl("cpeptid", outcome) ~ "C-peptide",
+        grepl("glucose", outcome) ~ "Glucose",
+        grepl("HbA1c", outcome) ~ "HbA1c",
+        grepl("chol_hdl", outcome) ~ "HDL-C",
+        grepl("chol_ldl", outcome) ~ "LDL-C",
+        grepl("chol_total", outcome) ~ "TC",
+        grepl("triglycerides", outcome) ~ "TG",
+        grepl("hs_CRP_SSI", outcome) ~ "hs-CRP",
+        grepl("leucocytes", outcome) ~ "WBC",
+        grepl("glucagon", outcome) ~ "Glucagon",
+        grepl("glp1", outcome) ~ "Total GLP-1",
+        grepl("bp_sys_z", outcome) ~ "SBP SDS",
+        grepl("bp_dia_z", outcome) ~ "DBP SDS",
+        )
+    ) %>% 
+    dplyr::mutate(group = "normal_weight") %>% 
+    select(outcome, group, N)
+
+cmr.n.groups <- full_join(cmr.n.ob, cmr.n.nw) 
+
+lm.cmr.factor.int$outcome <- factor(lm.cmr.factor.int$outcome, level=c("Liver fat %", "ALT","AST","GGT", "LDH","Bilirubin", "HDL-C", "LDL-C", "TC","TG", "C-peptide", "HOMA-IR","Insulin", "Glucose", "HbA1c", "hs-CRP", "WBC",  "Glucagon", "Total GLP-1", "SBP SDS", "DBP SDS"))
+lm.cmr.factor.intoutcome_class <- factor(lm.cmr.factor.int$outcome_class, level=c("Liver", "Lipid", "Glycemic", "Inflammatory", "Proglucagon", "Blood pressure"))
+
+lm.cmr.factor.int.n <- lm.cmr.factor.int %>% 
+    full_join(cmr.n.groups, by = join_by(outcome, group))
+
+S6 <- lm.cmr.factor.int.n %>% 
+    dplyr::mutate(Assay = gsub("X4EBP1", "4EBP1", Assay),
+                  covariates = "group, age, sex, storage time") %>% 
+    dplyr::rename(beta = estimate,
+                  se = std.error,
+                  exposure = Assay) %>% 
+    dplyr::select(outcome, exposure, group, N, beta, se, p.value, fdr, p.val.int, int.fdr) %>%
+    dplyr::filter(int.fdr < 0.05) %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::mutate_at(vars(beta, se, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>% 
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>%
+    dplyr::mutate_at(vars(p.value, fdr, p.val.int, int.fdr), funs(sprintf("%.3G", .))) %>%
+    dplyr::select(-CI_Lower, -CI_Upper, -se) %>% 
+    pivot_wider(names_from = group,
+                values_from = c(N, beta, CI, p.value, fdr)) %>% 
+    dplyr::arrange(outcome, exposure) %>%
+    dplyr::select(exposure, outcome, N_obesity, beta_obesity, CI_obesity, p.value_obesity, fdr_obesity, N_normal_weight, beta_normal_weight, CI_normal_weight, p.value_normal_weight, fdr_normal_weight, p.val.int, int.fdr) 
+S6
+
+forest.int.ob <- lm.cmr.factor.int %>% 
+    dplyr::arrange(p.val.int) %>% 
+    dplyr::filter(Assay == "CDCP1" |  Assay == "FGF21" | Assay == "HAOX1") %>% 
+    dplyr::filter(outcome == "ALT" | outcome == "AST"| outcome == "GGT") %>% 
+    mutate(
+        ci.lower = estimate - 1.96 * std.error,  # Lower bound of 95% CI
+                  ci.upper = estimate + 1.96 * std.error,
+    significance = factor(case_when(
+      p.value < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    ), levels = c("P < 5% FDR", "P < 0.05", "Not Significant")),
+    group = case_when(
+      group == "obesity" ~ "Overweight/Obesity",
+      group == "normal_weight" ~ "Normal weight",
+      TRUE ~ group
+    )
+  )
+
+# Create a basic forest plot using ggplot2
+fig4c <- forest.int.ob  %>% 
+    ggplot(aes(x = estimate, y = Assay, color = group)) +
+  geom_vline(xintercept = 0, linetype = 1, color = "gray40") +  # Reference line at 1 (e.g., for odds ratios)
+    geom_point(aes(size = significance)) +  # Points for the estimates
+  geom_errorbarh(aes(xmin = ci.lower, xmax = ci.upper), height = 0.01) +  # Horizontal error bars for 95% CI
+  labs(
+    x = "β (95% CI) per s.d. unit",
+    y = " ",
+    color = " ",  # Custom title for the color legend (group)
+    size = "P-value" 
+  ) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12, colour = "black"),
+        axis.title = element_text(size = 12, colour = "black"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text = element_text(size = 12, colour = "black"),
+        strip.background = element_rect(fill = "white", color = "white"),
+    legend.position = "right",    # Place the legend at the bottom
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y= element_blank(),
+    panel.grid.major.y= element_blank()
+  ) +
+  scale_color_manual(values = c("#543005", "#9ec2e4"))  + # Use a color palette from RColorBrewer #"#C6DBEF"
+  scale_size_manual(values = c("P < 5% FDR" = 4, "P < 0.05" = 3, "Not Significant" = 2), drop = T) +  
+  scale_shape_manual(values = c("P < 5% FDR" = 16, "P < 0.05" = 16, "Not Significant" = 16), drop = T) + 
+    facet_wrap(~ outcome)
+fig4c 
+```
+## Predictive performance of protein markers to detect hepatic steatosis
+
+```{r glmnet, warning=FALSE, echo=FALSE}
+library(glmnet)
+
+df_na <- df %>% 
+    dplyr::select(liverfat_5perc, IL8:HAOX1) %>% 
+    drop_na()
+
+y <- df_na$liverfat_5perc
+
+# Convert the list to a matrix
+x <- df_na %>% 
+    dplyr::select(IL8:HAOX1) %>% 
+    as.matrix()
+
+# Number of bootstrap iterations
+n_iterations <- 1000
+
+# Initialize vector to store accuracy for each bootstrap iteration
+accuracy_boot <- numeric(n_iterations)
+
+# Start bootstrapping
+set.seed(123)  # Set seed for reproducibility
+for (i in 1:n_iterations) {
+  # Step 1: Create a bootstrap sample (resample the data with replacement)
+  bootstrap_indices <- sample(seq_len(nrow(x)), size = nrow(x), replace = TRUE)
+  
+  # Training data from the bootstrap sample
+  x_train <- x[bootstrap_indices, ]
+  y_train <- y[bootstrap_indices]
+  
+  # Out-of-bag (OOB) data: The rows not included in the bootstrap sample
+  oob_indices <- setdiff(seq_len(nrow(x)), bootstrap_indices)
+  x_test <- x[oob_indices, ]
+  y_test <- y[oob_indices]
+  
+  # Step 2: Fit the model using the training data (logistic regression with LASSO)
+  if (length(oob_indices) > 0) {  # Only evaluate if there are OOB samples
+    cv_model <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = 5)
+    
+    # Extract the best lambda (lambda.min)
+    best_lambda <- cv_model$lambda.min
+    
+    # Fit the final model using the best lambda
+    final_model <- glmnet(x_train, y_train, family = "binomial", lambda = best_lambda)
+    
+    # Step 3: Predict on the OOB test set
+    pred_prob <- predict(final_model, newx = x_test, type = "response")
+    pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+    
+    # Step 4: Calculate accuracy for this bootstrap iteration
+    accuracy_boot[i] <- mean(pred_class == y_test)
+  }
+}
+
+# Step 5: Summary of bootstrapped performance estimates
+mean_accuracy <- mean(accuracy_boot, na.rm = TRUE)
+sd_accuracy <- sd(accuracy_boot, na.rm = TRUE)
+
+# Calculate 95% Confidence Interval
+z_value <- 1.96  # For 95% CI
+se_accuracy <- sd_accuracy / sqrt(n_iterations)  # Standard error of the mean
+
+lower_ci <- mean_accuracy - z_value * se_accuracy
+upper_ci <- mean_accuracy + z_value * se_accuracy
+
+# View the mean accuracy, standard deviation, and 95% confidence interval
+cat("Mean Accuracy:", mean_accuracy, "\n")
+cat("Standard Deviation of Accuracy:", sd_accuracy, "\n")
+cat("95% Confidence Interval: [", lower_ci, ",", upper_ci, "]\n")
+
+```
+
+```{r prediction, warning=FALSE, echo=FALSE}
+library(caret)
+library(pROC)
+
+myControl <- trainControl(
+  method = "repeatedcv", 
+  number = 5, repeats = 10, 
+  sampling = "down", 
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE, 
+  savePredictions = TRUE,
+  verboseIter = FALSE
+)
+
+df_liver <- df %>% 
+    dplyr::select(liverfat_5perc, ALAT, ASAT, GGT, CDCP1, FGF21, HAOX1) %>% 
+    drop_na()
+
+# Adjust the dependent variable
+df_liver$steatosis <- factor(df_liver$liverfat_5perc, 
+                                   levels = c(0, 1), 
+                                   labels = c("No", "Yes"))
+
+# Update the formulas to include new variables 
+formula1 <- as.formula(steatosis ~ CDCP1 + FGF21 + HAOX1)
+formula2 <- as.formula(steatosis ~ ALAT + ASAT + GGT)
+formula3 <- as.formula(steatosis ~ CDCP1 + FGF21 + HAOX1 + ALAT + ASAT + GGT)
+
+# Train the models
+set.seed(125)
+fmodel1 <- train(formula1, data = df_liver, method = "glm", 
+                 trControl = myControl, preProcess = c("center", "scale"), metric = "ROC")
+
+set.seed(125)
+fmodel2 <- train(formula2, data = df_liver, method = "glm", 
+                 trControl = myControl, preProcess = c("center", "scale"), metric = "ROC")
+
+set.seed(125)
+fmodel3 <- train(formula3, data = df_liver, method = "glm", 
+                 trControl = myControl, preProcess = c("center", "scale"), metric = "ROC")
+
+# Use roc to evaluate models
+frocs <- list()
+frocs[["fmodel1"]] <- roc(fmodel1$pred$obs, fmodel1$pred$Yes)
+frocs[["fmodel2"]] <- roc(fmodel2$pred$obs, fmodel2$pred$Yes)
+frocs[["fmodel3"]] <- roc(fmodel3$pred$obs, fmodel3$pred$Yes)
+ggroc(frocs)
+
+# Calculate confidence intervals
+fcv.ci.list <- sapply(frocs, function(x) {
+  ci <- ci.auc(x)
+})
+rownames(fcv.ci.list) <- c("lower_CI", "auc", "upper_CI")
+fcv.ci.list.df <- data.frame(t(fcv.ci.list))
+
+# Update the row names for the legend
+row.names(fcv.ci.list.df) <- c("CDCP1 + FGF21 + HAOX1", 
+                               "ALT + AST + GGT", 
+                               "Combined Model")
+
+# Confidence intervals for the ROC curves
+ci.list <- lapply(frocs, ci.se, specificities = seq(0, 1, l = 25))
+dat.ci.list <- lapply(ci.list, function(ciobj) 
+  data.frame(x = as.numeric(rownames(ciobj)),
+             lower = ciobj[, 1],
+             upper = ciobj[, 3]))
+
+# Format legend data
+data.legend <- fcv.ci.list.df %>% 
+  dplyr::mutate(across(where(is.numeric), ~ round(., digits = 2))) %>% 
+  mutate(Model = row.names(fcv.ci.list.df)) %>% 
+  mutate(label_long = paste(Model, ", AUC =", paste(auc), sep = "")) %>% 
+  mutate(ci = paste("(95% CI: ", lower_CI, "-", upper_CI, ")", sep = "")) %>% 
+  mutate(label_n = paste(Model, paste("AUC =", auc, ci, sep = " "), sep = "\n"))
+
+# Plot ROC curves
+p <- ggroc(frocs) + 
+  theme_minimal() + 
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", alpha = 0.7, color = "grey") + 
+  coord_equal() + 
+  scale_color_discrete(labels = data.legend$label_n, name = "") + 
+  theme_classic() +
+    labs(x = "Specificity",
+         y = "Sensitivity") +
+  theme(legend.position = c(0.7, 0.2),
+        legend.text = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12, colour = "black"),
+        axis.title = element_text(size = 12, colour = "black"),
+        legend.key.size = unit(1.7, 'lines')) 
+
+# Add confidence intervals to the plot
+for(i in 1:3) {
+  fig4d <- p + geom_ribbon(
+    data = dat.ci.list[[i]],
+    aes(x = x, ymin = lower, ymax = upper),
+    fill = i + 1,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  )
+}
+
+# Test for differences in AUC
+roc.test(frocs[["fmodel2"]], frocs[["fmodel3"]], method = "delong", paired = FALSE,
+         alternative = "two.sided", conf.level = 0.95, reuse.auc = TRUE)
+
+```
+
+```{r fig4, warning=FALSE, echo=FALSE}
+
+glm.cmr.feature2 <- glm.cmr.feature %>% mutate(
+    significance = case_when(
+      p.value < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    ),
+    outcome = case_when(
+      outcome == "Hepatic steatosis (liver fat ≥ 5.0 %)" ~ "Liver fat ≥5.0%",
+      TRUE ~ outcome
+    )
+  ) 
+
+glm.cmr.df <- glm.cmr.feature2[glm.cmr.feature2$exposure %in% top_pro$exposure, ]
+
+# Reorder the exposures based on clustering
+glm.cmr.df$exposure <- factor(glm.cmr.df$exposure, levels = exposure_hclust$labels[exposure_hclust$order])
+
+glm.cmr.df$outcome <-
+    factor(
+        glm.cmr.df$outcome,
+        levels = c(
+            "Liver fat ≥5.0%",
+            "High ALT",
+            "Dyslipidemia",
+            "Insulin resistance",
+            "Hyperglycemia",
+            "Hypertension"
+        ))
+
+fig4a <- glm.cmr.df %>%
+  ggplot(aes(x = outcome, y = exposure, fill = OR)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", high = "orange", mid = "white", midpoint = 1, 
+                       name = "OR") +  # Color gradient based on beta values
+  theme_bw() +  # Clean theme
+  labs(x = " ", y = " ") +
+    geom_point(data = glm.cmr.df  %>% filter(significance == "P < 5% FDR"),
+             aes(x = outcome, y = exposure, shape = "P < 5% FDR", color = "P < 5% FDR"),  # Map shape and color to legend
+              fill = "black", size = 1, stroke = 0.4, show.legend = FALSE) +
+
+  # Circle with border for p < 0.05 but not P < 5% FDR
+  geom_point(data = glm.cmr.df  %>% filter(significance == "P < 0.05" & fdr >= 0.05),
+             aes(x = outcome, y = exposure, shape = "P < 0.05", color = "P < 0.05"),  # Map shape and color to legend
+            fill = "transparent", size = 1, stroke = 0.4, show.legend = FALSE) + 
+
+
+  # Add shape legend
+  scale_shape_manual(values = c("P < 5% FDR" = 21, "P < 0.05" = 21), name = "P-value") +
+
+  # Use color to differentiate the circles
+  scale_color_manual(values = c("P < 5% FDR" = "black", "P < 0.05" = "grey20"),
+                     name = "P-value") +
+  theme(axis.text.y = element_text(size = 12, colour = "black"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12, colour = "black"),  # Rotate x-axis text
+        axis.title = element_text(size = 12),
+        panel.grid = element_blank(),  # Remove grid lines
+        legend.text = element_text(size = 11, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        legend.position = "bottom",
+        strip.text.x = element_blank(),
+        strip.background.y = element_rect(fill = "white", color = "white"),  # Set strip background to white with a black border
+    strip.text = element_text(color = "black", size = 12)
+  ) +
+    guides(
+    shape = guide_legend(override.aes = list(size = 2)),  # Increase point size in legend
+    color = guide_legend(override.aes = list(size = 2))   # Increase color point size in legend
+  ) +
+  facet_grid( ~ outcome_class, scales = "free_x", space = "free_x")  # Ensure consistent tile size across facets
+fig4a
+
+library(patchwork)
+
+# Combine the two plots side by side
+fig4ab <- fig4a + fig4b + plot_layout(ncol = 2, widths = c(0.5, 2)) 
+print(fig4ab)
+
+fig4 <- fig4ab / (fig4c + fig4d) + 
+  plot_layout(ncol = 1, heights = c(0.8, 0.45), widths = c(1, 0.4, 0.6))  + 
+  plot_annotation(tag_levels = list('a', 'b', 'c', 'd')) & 
+  theme(plot.tag = element_text(face = "bold", size = 12))
+fig4
+
+```
+
+## The effect of personalized obesity management
+
+```{r BMI-loss-protein, warning=FALSE, echo=TRUE}
+
+olink_fu_serum <- merge(mbl_meta_sel, olink_format_filt, by=c("sample_ID", "visit")) 
+
+delta_olink_df <- olink_fu_serum %>% 
+  group_by(sample_ID) %>% 
+  filter(n() == 2) %>%
+  arrange(sample_ID, visit) %>% #BL first
+  summarise_at(vars(11:38, 42:132), funs((.[visit == "follow-up"]) - (.[visit == "baseline"]))) 
+
+colnames(delta_olink_df)[-1] <- paste(colnames(delta_olink_df[, -1]), "delta", sep=".")  
+
+delta_olink_df$z_BMI.loss <- olink_fu_serum$z_BMI[olink_fu_serum$visit == "baseline"] - olink_fu_serum$z_BMI[olink_fu_serum$visit == "follow-up"]
+
+cf_olink_delta <- delta_olink_df 
+
+cf_olink_delta$Gender <-  olink_fu_serum$gender[match(cf_olink_delta$sample_ID, olink_fu_serum$sample_ID)]
+
+cf_olink_delta$Diff_year <-  olink_fu_serum$Diff_year[match(cf_olink_delta$sample_ID, olink_fu_serum$sample_ID)]
+
+cf_olink_delta$Age_base <- olink_fu_serum$age[olink_fu_serum$visit == "baseline" & olink_fu_serum$sample_ID %in% cf_olink_delta$sample_ID]
+
+cf_olink_delta$zBMI_base <- olink_fu_serum$z_BMI[olink_fu_serum$visit == "baseline" & olink_fu_serum$sample_ID %in% cf_olink_delta$sample_ID]
+
+cf_olink_delta$zBMI_fu <- olink_fu_serum$z_BMI[olink_fu_serum$visit == "follow-up" & olink_fu_serum$sample_ID %in% cf_olink_delta$sample_ID]
+
+delta_bmi_infs <- cf_olink_delta
+
+##linear model of on delat changes. 
+
+predictorVars <- "z_BMI.loss" 
+
+delta_bmi_infs[predictorVars] <- scale(delta_bmi_infs[predictorVars])
+
+## 1) List all outcome variables that need to be log-transformed
+
+outcomeVars <- colnames(cf_olink_delta)[30:121]
+
+delta_bmi_infs[outcomeVars] <- scale(delta_bmi_infs[outcomeVars])
+
+## 6) Assign covariates
+cov_vars <- c("Age_base", "Gender",  "Diff_year")
+
+cov_comb <-
+  unlist(sapply(seq_len(length(cov_vars)),
+                function(i) {
+                  apply(combn(cov_vars, i), 2, function(x)
+                    paste(x, collapse = "+"))
+                }))
+
+cov <-  cov_comb[c(7)]
+
+var_comb <- expand.grid(outcomeVars, predictorVars, cov)
+
+formula <- sprintf("%s~%s+%s", var_comb$Var1, var_comb$Var2, var_comb$Var3)
+
+#view(formula)
+lm <- lapply(formula, function(f)   {
+  lm <- lm(f, data = delta_bmi_infs)
+  lm$coefficients <- coef(summary(lm))
+  return(lm)
+})
+
+names(lm) <- formula
+
+lm<-
+  cbind(formula, as.data.frame(do.call(rbind, lapply(lm, function(x) {
+                                              coefs <- coef(x)
+                                              rbind(coefs[2, ])
+  }))))
+
+lm.delta.bmi.infs <- lm %>%
+  dplyr::rename(beta = "Estimate") %>%
+  dplyr::rename(se = "Std. Error") %>%
+  dplyr::rename(pvalue = "Pr(>|t|)") %>%
+  dplyr::select(-"t value") %>%
+  dplyr::mutate(CI_lower = (beta - 1.96 * se)) %>%
+  dplyr::mutate(CI_upper = (beta + 1.96 * se)) %>%
+    dplyr::mutate(var_comb =  var_comb$Var1) %>% 
+    dplyr::mutate(Outcome = gsub(".delta", "", var_comb)) %>% 
+     dplyr::mutate(Predictor =  "BMI SDS loss")
+ 
+lm.delta.bmi.infs_f <- lm.delta.bmi.infs %>% 
+    mutate(FDR = p.adjust (pvalue, method='fdr')) %>% 
+    mutate(bon = p.adjust (pvalue, method='bon')) %>% 
+    dplyr::mutate(Size_fdr = case_when( pvalue >= 0.05  ~ "1",
+                               pvalue < 0.05 & FDR >= 0.05  ~ "2",
+                               FDR < 0.05  ~ "4")) %>%
+        dplyr::mutate(label_char_fdr = case_when(FDR >= 0.05 ~ " ",
+                                 FDR < 0.05 & bon >= 0.05 ~ "*",
+                                 bon < 0.05 ~ "#"))
+
+panel <- panel_df %>% 
+    dplyr::rename(outcome = Assay) %>% 
+    dplyr::filter(Panel == "INF")
+
+S7 <- lm.delta.bmi.infs_f %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::mutate_at(vars(beta, se, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>%
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>% 
+    dplyr::mutate_at(vars(p.value, fdr), funs(sprintf("%.3G", .))) %>% 
+    dplyr::select(exposure, outcome, N, beta, CI, p.value, fdr) %>% 
+    dplyr::arrange(exposure, outcome) %>% 
+    left_join(panel) %>% 
+    dplyr::filter(!is.na(Panel)) %>% 
+    dplyr::select(-Panel)
+S7
+
+panel <- panel_df %>% 
+    dplyr::rename(outcome = Assay) %>% 
+    dplyr::filter(Panel == "INF")
+
+fig5a_df <- data.table::fread(here::here("doc/olink/data/S7.txt")) %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>%
+    dplyr::arrange(exposure, outcome) %>% 
+    left_join(panel) %>% 
+    dplyr::filter(!is.na(Panel)) %>% 
+    dplyr::select(-Panel) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+fig5a <- fig5a_df %>% 
+    ggplot(aes(x = beta, y = reorder(outcome, beta), color = significance)) +
+    geom_vline(xintercept = 0, linetype = 1, color = "gray40") +
+  geom_pointrange(
+    aes(xmin = CI_Lower, xmax = CI_Upper),
+    linetype = 1,  # CI with dashed lines
+    size = 0.8            # Optional: adjust point size
+  ) +
+  geom_point(size = 3) +  # Emphasize the beta points
+    scale_color_manual(values = c("P < 0.05" = "#3d85c6", "P < 5% FDR" = "#f6b26b", "Not Significant" = "grey60")) +
+  coord_flip() +          # Flip coordinates to make exposure names on y-axis
+  theme_bw() +       # Clean and minimal theme
+  labs(y = " ", 
+       x = "Beta (95% CI)", 
+       color = "P-value"
+       #title = "Forest Plot of Beta and CI"
+       ) +
+    xlim(-0.6, 0.4) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.text = element_text(size = 12, color = "black"),
+         legend.title = element_text(size = 12, color = "black"),
+    axis.title = element_text(size = 12, color = "black"),
+    axis.text.x = element_text(size = 12, color = "black", angle = 90, hjust = 1, vjust = 0.5),
+    axis.text.y = element_text(size = 12, color = "black")
+  )
+fig5a
+
+```
+
+```{r intervention-cmr-protein, warning=FALSE, echo=FALSE}
+
+predictorVars <- colnames(delta_infs_tra[, 30:121])
+
+delta_infs_tra[predictorVars] <- scale(delta_infs_tra[predictorVars])
+
+##List all outcome variables 
+outcomeVars <- c("liver_fat.delta","ALAT.delta",  "ASAT.delta", "LDH.delta" , "bilirubin.delta",  "GGT.delta" , "triglycerides.delta", "chol_total.delta", "chol_hdl.delta" , "chol_ldl.delta" , "cpeptide.delta", "HOMA.delta", "insulin.delta", "HbA1c.delta",  "glucose.delta", "leukocytes.delta",  "z_BP_sys.delta",  "z_BP_dia.delta")
+
+##Function to log transform non-normally distributed outcomeVars
+delta_infs_tra[paste('z', outcomeVars, sep = '_')] <- scale(delta_infs_tra[outcomeVars])
+
+##linear model for all normally distributed proteins
+z_outcomeVars <- c("z_liver_fat.delta", "z_ALAT.delta",  "z_ASAT.delta", "z_LDH.delta" , "z_bilirubin.delta",  "z_GGT.delta" , "z_triglycerides.delta",   "z_chol_total.delta" , "z_chol_hdl.delta" , "z_chol_ldl.delta" ,  "z_cpeptide.delta", "z_HOMA.delta", "z_insulin.delta", "z_HbA1c.delta",  "z_glucose.delta",  "z_leukocytes.delta", "z_z_BP_sys.delta" ,  "z_z_BP_dia.delta")
+
+##Assign covariates
+cov_vars <- c("Age_base", "Gender",  "Diff_year", "zBMI_base", "z_BMI.delta")
+
+cov_comb <-
+  unlist(sapply(seq_len(length(cov_vars)),
+                function(i) {
+                  apply(combn(cov_vars, i), 2, function(x)
+                    paste(x, collapse = "+"))
+                }))
+
+view(cov_comb)
+
+cov <-  cov_comb[c(16, 26:27, 31)]
+
+var_comb <- expand.grid(z_outcomeVars, predictorVars, cov)
+
+formula <- sprintf("%s~%s+%s", var_comb$Var1, var_comb$Var2, var_comb$Var3)
+
+#view(formula)
+lm <- lapply(formula, function(f)   {
+  lm <- lm(f, data = delta_infs_tra)
+  lm$coefficients <- coef(summary(lm))
+  return(lm)
+})
+
+names(lm) <- formula
+
+lm<-
+  cbind(formula, as.data.frame(do.call(rbind, lapply(lm, function(x) {
+                                              coefs <- coef(x)
+                                              rbind(coefs[2, ])
+  }))))
+
+
+# Make Confidence intervals (CI):
+lm.delta.infs_tra <- lm %>%
+  dplyr::rename(beta = "Estimate") %>%
+  dplyr::rename(se = "Std. Error") %>%
+  dplyr::rename(pvalue = "Pr(>|t|)") %>%
+  dplyr::select(-"t value") %>%
+  dplyr::mutate(CI_lower = (beta - 1.96 * se)) %>%
+  dplyr::mutate(CI_upper = (beta + 1.96 * se)) %>%
+    dplyr::mutate(var_comb =  var_comb$Var2) %>% 
+     dplyr::mutate(Predictor =  gsub(".delta", "", var_comb)) %>% 
+  dplyr::mutate(cov = case_when(
+    grepl("Age_base[+]Gender[+]Diff_year$", formula, perl = TRUE) ~ "as",
+     grepl("Age_base[+]Gender[+]Diff_year[+]zBMI_base$", formula, perl = TRUE) ~ "asb",
+     grepl("Age_base[+]Gender[+]Diff_year[+]z_BMI.delta$", formula, perl = TRUE) ~ "asdeltab",
+    grepl("Age_base[+]Gender[+]Diff_year[+]zBMI_base[+]z_BMI.delta$", formula, perl = TRUE) ~ "asbdeltab")) %>% 
+  dplyr::mutate(Outcome = case_when(
+     grepl("^z_liver_fat.delta", formula, perl = TRUE) ~ "Liver fat %",
+     grepl("^z_ALAT.delta", formula, perl = TRUE) ~ "ALT",
+     grepl("^z_ASAT.delta", formula, perl = TRUE) ~ "AST",
+     grepl("^z_GGT.delta", formula, perl = TRUE) ~ "GGT",
+     grepl("^z_LDH.delta", formula, perl = TRUE) ~ "LDH",
+     grepl("^z_bilirubin.delta", formula, perl = TRUE) ~ "Bilirubin",
+     grepl("^z_chol_total.delta", formula, perl = TRUE) ~ "TC",
+     grepl("^z_chol_ldl.delta", formula, perl = TRUE) ~ "LDL-C",
+     grepl("^z_chol_hdl.delta", formula, perl = TRUE) ~ "HDL-C",
+     grepl("^z_triglycerides.delta", formula, perl = TRUE) ~ "TG",
+     grepl("^z_cpeptid.delta", formula, perl = TRUE) ~ "c-peptid",
+     grepl("^z_glucose.delta", formula, perl = TRUE) ~ "Glucose",
+     grepl("^z_HbA1c.delta", formula, perl = TRUE) ~ "HbA1c",
+     grepl("^z_insulin.delta", formula, perl = TRUE) ~ "Insulin",
+    grepl("^z_HOMA.delta", formula, perl = TRUE) ~ "HOMA-IR",
+    grepl("^z_leukocytes.delta", formula, perl = TRUE) ~ "WBC",
+    grepl("^z_z_BP_sys.delta", formula, perl = TRUE) ~ "SBP SDS",
+    grepl("^z_z_BP_dia.delta", formula, perl = TRUE) ~ "DBP SDS",
+    )) %>% 
+    filter(!is.na(Outcome))
+    
+delta_vars_order <- c( "liver_fat.delta","ALAT.delta",  "ASAT.delta", "LDH.delta", "bilirubin.delta",  "GGT.delta" , "triglycerides.delta", "chol_total.delta", "chol_hdl.delta" , "chol_ldl.delta" , "cpeptide.delta", "HOMA.delta", "insulin.delta", "HbA1c.delta",  "glucose.delta", "z_leukocytes.delta","z_BP_sys.delta" ,  "z_BP_dia.delta")
+
+lm.delta.infs_tra$Outcome <- as.factor(lm.delta.infs_tra$Outcome)
+lm.delta.infs_tra$cov <- as.factor(lm.delta.infs_tra$cov)
+
+lm.delta.infs_tra_f <- lm.delta.infs_tra %>% 
+    dplyr::group_by(cov, Outcome) %>% 
+    dplyr::mutate(FDR = p.adjust(pvalue, method='fdr')) %>% 
+    dplyr::mutate(Size_fdr = case_when(pvalue >= 0.05 ~ "1",
+                               pvalue < 0.05 & FDR >= 0.05  ~ "2",
+                               FDR < 0.05  ~ "4")) %>%
+    dplyr::mutate(label_char_pval_fdr = case_when(pvalue >= 0.05 ~ " ",
+                               pvalue < 0.05 & FDR >= 0.05  ~ "+",
+                               FDR < 0.05  ~ "*")) %>%  
+    dplyr::mutate(Outcome_class = case_when(
+  Outcome %in% c("Liver fat %", "ALT","AST", "GGT","LDH","Bilirubin") ~ "Liver",
+  Outcome %in% c("HDL-C", "LDL-C", "TC","TG") ~ "Traditional lipids",
+  Outcome %in% c("C-peptide", "HOMA-IR","Insulin", "Glucose", "HbA1c") ~ "Glycemic", 
+  Outcome %in% c("WBC") ~ "Inflammatory",
+  Outcome %in% c("DBP SDS", "SBP SDS") ~ "Blood pressure" ))
+
+panel <- panel_df %>% 
+    dplyr::rename(exposure = Assay) %>% 
+    dplyr::filter(Panel == "INF")
+
+s8 <- lm.delta.infs_tra_f
+
+s8$outcome <-
+    factor(
+        s8$outcome,
+        levels = c(
+            "Liver fat %",
+            "ALT",
+            "AST",
+            "GGT",
+            "LDH",
+            "Bilirubin",
+            "WBC",
+            "HOMA-IR",
+            "Insulin",
+            "C-peptide",
+            "Glucose",
+            "HbA1c",
+            "HDL-C",
+            "LDL-C",
+            "TC",
+            "TG",
+            "SBP SDS",
+            "DBP SDS"
+        ))
+        
+S8 <- s8 %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::mutate_at(vars(beta, se, CI_Lower, CI_Upper), funs(sprintf("%.2f", .))) %>%
+    dplyr::mutate(CI = paste0("(", CI_Lower, " , ", CI_Upper, ")")) %>% 
+    dplyr::mutate_at(vars(p.value, fdr), funs(sprintf("%.3G", .))) %>% 
+    dplyr::select(exposure, outcome, N, beta, CI, p.value, fdr) %>% 
+    dplyr::arrange(outcome, exposure) %>% 
+    left_join(panel) %>% 
+    dplyr::filter(!is.na(Panel)) %>% 
+    dplyr::select(-Panel)
+S8
+
+panel <- panel_df %>% 
+    dplyr::rename(exposure = Assay) %>% 
+    dplyr::filter(Panel == "INF")
+
+s8 <- data.table::fread(here::here("doc/olink/data/S8.txt")) 
+
+s8$outcome <-
+    factor(
+        s8$outcome,
+        levels = c(
+            "DBP SDS",
+            "SBP SDS",
+            "TG",
+            "TC",
+            "LDL-C",
+            "HDL-C",
+            "HbA1c",
+            "Glucose",
+            "C-peptide",
+            "Insulin",
+            "HOMA-IR",
+            "WBC",
+            "Bilirubin",
+            "LDH",
+            "GGT",
+            "AST",
+            "ALT",
+            "Liver fat %"
+        ))
+        
+fig5b_df <- s8 %>% 
+    dplyr::mutate(CI_Lower = beta - 1.96 * se,  # Lower bound of 95% CI
+                  CI_Upper = beta + 1.96 * se) %>% 
+    dplyr::arrange(outcome, exposure) %>% 
+    left_join(panel) %>% 
+    dplyr::filter(!is.na(Panel)) %>% 
+    dplyr::select(-Panel) %>% 
+    mutate(
+    significance = case_when(
+      p.value < 0.05 & fdr >= 0.05 ~ "P < 0.05",
+      fdr < 0.05 ~ "P < 5% FDR",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+fig5b_sig <- fig5b_df %>% 
+    dplyr::filter(fdr < 0.05) %>% 
+    dplyr::distinct(exposure) #38
+
+fig5b_filter <- fig5b_df %>% 
+    dplyr::filter(exposure %in% fig5b_sig$exposure)
+
+fig5b_filter$category <-
+    factor(
+        fig5b_filter$category,
+        levels = c(
+            "Liver",
+            "Lipid",
+            "Inflammatory",
+            "Glycemic",
+            "Blood pressure"
+        ))
+
+fig5b <- fig5b_filter %>% 
+    mutate(Panel = "INF") %>% 
+  ggplot(aes(x = exposure, y = outcome, fill = beta)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", high = "orange", mid = "white", midpoint = 0, 
+                       name = "Beta") +  # Color gradient based on beta values
+  
+  # Filled black circles for FDR < 0.05
+  geom_point(data = fig5b_filter %>% filter(significance == "P < 5% FDR"),  
+             aes(x = exposure, y = outcome, shape = "P < 5% FDR", color = "P < 5% FDR"),  # Map shape and color to legend
+             fill = "black", size = 1.5, stroke = 0.6) + 
+  
+  # Circle with border for p < 0.05 but not P < 5% FDR
+  geom_point(data = fig5b_filter %>% filter(significance == "P < 0.05" & fdr >= 0.05),  
+             aes(x = exposure, y = outcome, shape = "P < 0.05", color = "P < 0.05"),  # Map shape and color to legend
+             fill = "transparent", size = 1.5, stroke = 0.6) +
+  
+  # Add shape legend
+  scale_shape_manual(values = c("P < 5% FDR" = 21, "P < 0.05" = 21), name = "P-value") +
+  
+  # Use color to differentiate the circles
+  scale_color_manual(values = c("P < 5% FDR" = "black", "P < 0.05" = "grey20"), 
+                     name = "P-value") +
+  
+  theme_bw() +  # Clean theme
+  labs(x = " ", y = " ") +
+  theme(axis.text.y = element_text(size = 12, colour = "black"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12, colour = "black"),  # Rotate x-axis labels
+        axis.title = element_text(size = 12),
+        panel.grid = element_blank(),  # Remove grid lines
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+         strip.background = element_rect(fill = "white", color = "white"),  # Set strip background to white with a black border
+    strip.text = element_blank()
+  )  +
+  facet_grid(category ~ Panel, scales = "free", space = "free")
+fig5b
+
+fig5 <-
+    ggpubr::ggarrange(
+        fig5a,
+        fig5b,
+        nrow = 2,
+        ncol = 1,
+        labels = c("a", "b"),
+        font.label = list(color = "black", size = 12)
+    )
+fig5
+
+```
+
+## Extended Data Table 1
+
+```{r extened-data-table1}
+
+olink_format <- olink %>% 
+  mutate(visit=if_else(grepl("BL", timepoint), "baseline", "follow-up")) %>%
+  separate(SampleID, c("timepoint","SampleID"), sep="-")%>%
+  mutate(sample_ID = case_when(
+    grepl("F",timepoint) ~ timepoint,
+    grepl("N",timepoint) ~ timepoint,
+    grepl("2318",SampleID) ~ "N2318",
+    grepl("0705",SampleID) ~ "N0705",
+    timepoint <= 3 & SampleID != "2318" & SampleID != "0705" ~ paste("F",SampleID, sep="") #390
+  )) 
+
+olink_format_filt <- olink_format %>% 
+  dplyr::select(sample_ID, visit, everything()) %>% 
+    group_by(sample_ID) %>% 
+    filter(n() == 2) %>%   #374
+    dplyr::select(-c("timepoint", "SampleID", "newid", "cohort", "sampletype", "CBMRID"))
+
+mbl_meta_f <- mbl_meta %>%  
+    mutate_at(c(8:95), as.numeric) %>%  
+    mutate(visit = case_when(
+    grepl("BL",CBMR_ID) ~ "baseline",
+    grepl("FU",CBMR_ID) ~ "follow-up")) %>% 
+    filter(!is.na(z_BMI)) %>%  #1 one doesn't have zbmi at fu
+    dplyr::group_by(pat_ID) %>%
+    filter(n() == 2) %>%  #398  #3ids have 1 visit
+      dplyr::mutate(Diff_day = as.integer(visit_date[visit == "follow-up"] - visit_date[visit == "baseline"])) %>% 
+      dplyr::mutate(Diff_year = Diff_day/365) 
+
+mbl_meta_f$gender[mbl_meta_f$gender == "F"] <- 2
+mbl_meta_f$gender[mbl_meta_f$gender == "M"] <- 1
+
+length(unique(mbl_meta_f$pat_ID)) #198
+
+colnames(mbl_meta_f)[which(names(mbl_meta_f) == "liver_ fat")] <- "liver_fat"
+
+mbl_meta_sel <- mbl_meta_f %>% 
+    dplyr::select("pat_ID", "CBMR_ID" , "sample_ID", "visit", "Diff_day", "Diff_year",  "age" , "gender" ,   "visit_date",  "height", "weight" , "waist" , "hip",  "z_BMI", "fat_percent",  "liver_fat", "ALAT", "ASAT" ,"GGT", "LDH", "bilirubin","triglycerides",  "chol_total", "chol_hdl", "chol_ldl", "cpeptide","insulin" ,  "glucose",   "HbA1c", "hsCRP", "leukocytes", "leptin",  "adiponectin", "z_BP_sys", "z_BP_dia") %>% 
+     dplyr::mutate(HOMA = insulin * glucose/22.5) %>% 
+      dplyr::mutate(LA_ratio=leptin/adiponectin) %>% 
+      dplyr::mutate(WHR=waist/hip) %>% 
+      dplyr::mutate(WHtR=waist/height) %>%  #396
+      filter(sample_ID %in% olink_format_filt$sample_ID) %>% #370, 185 sample_ID
+     dplyr::mutate(delta_zBMI= z_BMI[visit == "follow-up"] - z_BMI[visit == "baseline"]) %>% 
+      dplyr::mutate(respond = case_when(
+      delta_zBMI < 0 ~ "Decreased BMI",
+      delta_zBMI >= 0 ~ "Increased BMI"
+    )) 
+
+olink_fu_serum <- merge(mbl_meta_sel, olink_format_filt, by=c("sample_ID", "visit"))
+
+vars.fu = c("age" , "gender" , "Diff_year",  "z_BMI", "fat_percent", "waist" , "WHtR", "WHR", "liver_fat", "ALAT", "ASAT" ,"GGT", "LDH", "bilirubin","triglycerides", "chol_total", "chol_hdl", "chol_ldl", "cpeptide", "HOMA", "insulin" ,  "glucose",   "HbA1c", "hsCRP",  "leukocytes", "leptin",  "adiponectin", "LA_ratio","z_BP_sys", "z_BP_dia")
+
+preprocessed_data <- mbl_meta_sel %>%
+  dplyr::group_by(sample_ID) %>%
+  dplyr::mutate(across(all_of(vars.fu), ~ if(any(is.na(.))) rep(NA, length(.)) else .)) %>%
+  dplyr::ungroup()
+
+data_reshaped <- preprocessed_data %>%
+    dplyr::select("sample_ID", "visit", "age" , "gender", "z_BMI", "fat_percent", "waist" , "WHtR", "WHR", "liver_fat", "ALAT", "ASAT" ,"GGT", "LDH", "bilirubin","triglycerides", "chol_total", "chol_hdl", "chol_ldl", "cpeptide",  "HOMA", "insulin" ,  "glucose", "HbA1c", "hsCRP", "leukocytes", "leptin",  "adiponectin", "LA_ratio","z_BP_sys", "z_BP_dia", "respond") %>% 
+  pivot_wider(
+    names_from = visit, 
+    values_from = c(-sample_ID, -respond),  # Exclude ID and response columns
+    names_sep = "_"  # adds the separator between the original name and the visit name
+  ) %>% 
+    dplyr::select(- c("visit_baseline", "visit_follow-up"))
+
+names(data_reshaped) <- sub("_baseline", "_base", names(data_reshaped))
+names(data_reshaped) <- sub("_follow-up", "_fu", names(data_reshaped))
+
+diff_df <- data.frame(sample_ID = data_reshaped$sample_ID)
+
+for (var in unique(sub("_base|_fu", "", grep("_base|_fu$", names(data_reshaped), value = TRUE)))) {
+  base_col <- paste(var, "_base", sep = "")
+  fu_col <- paste(var, "_fu", sep = "")
+  diff_col <- paste(var, "_diff", sep = "")
+
+  # Add the differences to the diff_df
+  diff_df[[diff_col]] <- data_reshaped[[fu_col]] - data_reshaped[[base_col]]
+}
+
+results_all <- data.frame(Variable = character(), Median = numeric(), LowerQuartile = numeric(), UpperQuartile = numeric(), N = numeric(), PValue = numeric(), stringsAsFactors = FALSE)
+
+for (var in names(diff_df)[-1]) {  # Assuming the first column is 'sample_ID'
+  clean_data <- na.omit(diff_df[[var]])  # Remove NA values
+  
+  if (length(clean_data) >= 2) {
+    # Wilcoxon Signed-Rank Test
+    test_result <- wilcox.test(clean_data, mu = 0, conf.int = FALSE)
+    
+    # Median and IQR calculations
+    median_val = median(clean_data)
+    lower_quartile = quantile(clean_data, 0.25)
+    upper_quartile = quantile(clean_data, 0.75)
+
+    # Storing results
+    results_all <- rbind(results_all, data.frame(
+      Variable = var,
+      Median = median_val,
+      LowerQuartile = lower_quartile,
+      UpperQuartile = upper_quartile,
+      N = length(clean_data),
+      PValue = test_result$p.value
+    ))
+  }
+}
+
+results_all$Group <- "All"
+
+group_DecreasedBMI <- diff_df %>% 
+    filter(sample_ID %in% data_reshaped$sample_ID[data_reshaped$respond == "Decreased BMI"]) #151
+
+group_IncreasedBMI <- diff_df %>% 
+    filter(sample_ID %in% data_reshaped$sample_ID[data_reshaped$respond == "Increased BMI"]) #33
+
+
+# Initialize dataframes for results
+group_DecreasedBMI_results <- data.frame(Variable = character(),  Median = numeric(), LowerQuartile = numeric(), UpperQuartile = numeric(), N = numeric(), PValue = numeric(), stringsAsFactors = FALSE)
+
+
+group_IncreasedBMI_results <- data.frame(Variable = character(),  Median = numeric(), LowerQuartile = numeric(), UpperQuartile = numeric(), N = numeric(), PValue = numeric(), stringsAsFactors = FALSE)
+
+# Function to perform Wilcoxon test and calculate statistics
+analyze_group <- function(data, group_results) {
+  for (var in names(data)[-1]) {  # Assuming the first column is 'sample_ID'
+    clean_data <- na.omit(data[[var]])  # Remove NA values
+    if (length(clean_data) >= 2) {
+      # Wilcoxon Signed-Rank Test
+      test_result <- wilcox.test(clean_data, mu = 0, conf.int = FALSE)
+      
+      # Median and IQR calculations
+      median_val = median(clean_data)
+      lower_quartile = quantile(clean_data, 0.25)
+      upper_quartile = quantile(clean_data, 0.75)
+
+      # Storing results
+      group_results <- rbind(group_results, data.frame(
+        Variable = var,
+        Median = median_val,
+        LowerQuartile = lower_quartile,
+        UpperQuartile = upper_quartile,
+        N = length(clean_data),
+        PValue = test_result$p.value
+      ))
+    }
+  }
+  return(group_results)
+}
+# Perform analysis for each group
+group_DecreasedBMI_results <- analyze_group(group_DecreasedBMI, group_DecreasedBMI_results)
+group_DecreasedBMI_results$Group <- "Decreased BMI"
+
+group_IncreasedBMI_results <- analyze_group(group_IncreasedBMI, group_IncreasedBMI_results)
+group_IncreasedBMI_results$Group <- "Increased BMI"
+
+# Combine results
+combined_groups_changes <- rbind(results_all, group_DecreasedBMI_results, group_IncreasedBMI_results)
+
+combined_groups_f <- combined_groups_changes %>% 
+   dplyr::mutate(median_iqr = paste0(sprintf("%.2f", Median), " (", sprintf("%.2f", LowerQuartile), ", ", sprintf("%.2f", UpperQuartile), ")")) %>% 
+   dplyr::mutate(p_val = ifelse(PValue < 0.001, "<0.001", round(PValue, 3))) %>% 
+   dplyr::select(Variable, "median_iqr", "p_val", "N", Group) %>% 
+   tidyr::pivot_wider(id_cols = Variable,
+    names_from = c("Group"),
+    values_from = c("median_iqr", "p_val", "N"))%>% 
+    dplyr::select(Variable, N_All, median_iqr_All, p_val_All,
+                  "N_Decreased BMI", "median_iqr_Decreased BMI",  "p_val_Decreased BMI",
+                  "N_Increased BMI", "median_iqr_Increased BMI",  "p_val_Increased BMI") %>% 
+    dplyr::rename(trait = Variable) %>% 
+  dplyr::arrange(factor(trait, levels=vars.fu))%>%
+  dplyr::mutate(Characteristic = case_when(
+     grepl("gender", trait) ~ "Sex",
+     grepl("age", trait) ~ "Age, years",
+     grepl("Diff_year", trait) ~ "Duration, years",
+      grepl("z_BMI", trait) ~ "BMI SDS",
+      grepl ("fat_percent",	trait) ~ "Body fat %",
+      grepl ("waist",	trait) ~ "Waist",
+      grepl("WHtR", trait) ~ "WHtR",
+      grepl("WHR", trait) ~ "WHR",
+      grepl("liver_fat", trait) ~ "Liver fat %",
+      grepl("ALAT", trait) ~ "Plasma ALT, U/L",
+      grepl("ASAT", trait) ~ "Plasma AST, U/L",
+      grepl("GGT", trait) ~ "Plasma GGT, U/L",
+      grepl("LDH", trait) ~ "Plasma LDH, U/L",
+      grepl("bilirubin", trait) ~ "Plasma bilirubin, umol/L",
+      grepl("chol_hdl", trait) ~ "Plasma HDL-C, mmol/L",
+      grepl("chol_ldl", trait) ~ "Plasma LDL-C, mmol/L",
+      grepl("chol_total", trait) ~ "Plasma TC, mmol/L",
+      grepl("triglycerides", trait) ~ "Plasma TG, mmol/L",
+      grepl("insulin", trait) ~ "Serum insulin, pmol/L",
+      grepl("HOMA", trait) ~ "HOMA-IR, mIU/L",
+      grepl("HbA1c", trait) ~ "Whole blood HbA1c, mmol/mol",
+      grepl("glucose", trait) ~ "Plasma glucose, mmol/L",
+      grepl("cpeptid", trait) ~ "Serum C-peptide, nmol/L",
+      grepl("hsCRP", trait) ~ "Serum hs-CRP, mg/L",
+      grepl("leukocytes", trait) ~ "WBC",
+      grepl("leptin", trait) ~ "Leptin",
+      grepl("adiponectin", trait) ~ "Adiponectin",
+      grepl ("LA_ratio",trait) ~ "L/A ratio",
+      grepl ("z_BP_sys",trait) ~ "SBP SDS",
+      grepl ("z_BP_dia",trait) ~ "DBP SDS")) %>% 
+    dplyr::select(Characteristic, everything()) %>% 
+    dplyr::select(-trait)
+
+```
+
+## Cross-sectional average protein values 
+
+```{r cros-sectional-avgerage-protein, warning=FALSE, echo=FALSE}
+
+panel <- panel_df %>% 
+    dplyr::rename(protein = Assay) 
+data_long <- df %>%
+    dplyr::select(IL8:HAOX1) %>% 
+  pivot_longer(cols = IL8:HAOX1, 
+               names_to = "protein", 
+               values_to = "value")
+data_long
+
+cross_stats <- data_long %>%
+  group_by(protein) %>%
+  summarize(
+    median = median(value, na.rm = TRUE),    # Calculate the median
+    sd = sd(value, na.rm = TRUE)             # Calculate the standard deviation
+  ) %>%
+  mutate(timepoint = "baseline")   %>%           # Add a column for timepoint
+    mutate(protein = gsub("X4EBP1", "4EBP1", protein)) %>%
+    left_join(panel) %>% 
+    rename(olink_panel = Panel) %>% 
+    dplyr::select(protein, olink_panel, timepoint, median, sd) %>% 
+    arrange(protein)
+cross_stats
+
+write_csv(cross_stats, here::here("doc/olink/data/cross-sectional_median.csv"))
+
+```
+
+## Longitudinal average protein values
+
+```{r longitudinal-median-protein}
+
+panel <- panel_df %>% 
+    dplyr::rename(protein = Assay) %>% 
+    dplyr::filter(Panel == "INF")
+
+fu_serum <- olink_fu_serum %>% 
+    dplyr::select(sample_ID, visit, IL8:CSF1)
+
+fu_long <- fu_serum %>%
+  pivot_longer(cols = IL8:CSF1,  
+               names_to = "protein", 
+               values_to = "value")
+
+fu_stats <- fu_long %>%
+  group_by(protein, visit) %>%     # Group by protein and visit (timepoint)
+  summarize(
+    median = median(value, na.rm = TRUE),  # Calculate the median
+    sd = sd(value, na.rm = TRUE)           # Calculate the standard deviation
+  ) %>%
+  ungroup()  %>%  # Ungroup to remove grouping structure
+    mutate(protein = gsub("X4EBP1", "4EBP1", protein)) %>% 
+    rename(timepoint = visit) %>% 
+    right_join(panel) %>% 
+    rename(olink_panel = Panel) %>% 
+    arrange(protein) %>% 
+    dplyr::select(protein, olink_panel, timepoint, median, sd)
+fu_stats
+
+write_csv(fu_stats, here::here("doc/olink/data/longitudinal_median.csv"))
+```

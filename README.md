@@ -8,4 +8,4 @@
 The complete proteomics and clinical, phenotype data are available from the authors upon reasonable request.
 
 ## Study design
-<img src="https://github.com/sarastinson/olink_holbaek/blob/main/images/Fig1.png" alt="Sample Figure" width="800" height="600" />
+<img src="https://github.com/sarastinson/olink_holbaek/blob/main/images/NCOMMS_Fig1_study_design.png" alt="Sample Figure" width="800" height="600" />

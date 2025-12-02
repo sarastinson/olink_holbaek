@@ -8,5 +8,6 @@
 The complete proteomics and clinical, phenotype data are available from the authors upon reasonable request.
 
 ## Study design
-Created in BioRender. Stinson, S. (2025) https://BioRender.com/yloww5o
+Created in BioRender. Stinson, S. (2025) https://BioRender.com/yloww5o  
+
 <img src="https://github.com/sarastinson/olink_holbaek/blob/main/images/Fig1.jpg" alt="Sample Figure" width="700" height="650" />
